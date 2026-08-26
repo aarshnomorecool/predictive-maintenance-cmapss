@@ -1,0 +1,26 @@
+# Core data handling
+pandas>=2.2
+numpy>=1.26
+
+# Visualisation
+matplotlib>=3.8
+seaborn>=0.13
+plotly>=5.20
+
+# Classical ML (classification branch)
+scikit-learn>=1.4
+xgboost>=2.0
+imbalanced-learn>=0.12
+
+# Deep learning (RUL regression branch)
+tensorflow>=2.15
+
+# Explainability
+shap>=0.45
+
+# Serving
+flask>=3.0
+streamlit>=1.32
+
+# joblib ships with scikit-learn but pin it explicitly, model files depend on it
+joblib>=1.3
