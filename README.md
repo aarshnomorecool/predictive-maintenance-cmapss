@@ -103,6 +103,7 @@ Requires **Python 3.10 or newer**. Tested on 3.13.
 | `python -m src.eda` | Write figures to `reports/figures/` and `reports/eda_summary.md` |
 | `python verify_foundation.py` | 14 correctness checks over the data foundation |
 | `python -m src.train_classifier` | **Train RF + XGBoost**, live progress, saves to `models/` |
+| `python -m src.explainability` | SHAP attribution: which sensors drove a prediction |
 | `streamlit run dashboard/app.py` | **Launch the dashboard** |
 
 ### Training options
@@ -117,6 +118,18 @@ python -m src.train_classifier --trees 500 --rounds 1000
 Training prints live validation ROC-AUC as it goes. Every number that scrolls
 past is a real score from a real partially-trained model, not a progress
 animation. Expect roughly 40 seconds for the default run.
+
+### Explaining a prediction
+
+```bash
+python -m src.explainability                       # highest-risk engine, XGBoost
+python -m src.explainability --engine 24           # a specific engine
+python -m src.explainability --model RandomForest  # slower, ~0.15s per row
+```
+
+Prints fleet-wide SHAP importance and then a per-sensor breakdown of one
+engine's score, with the contributions summing back to the model's actual
+output.
 
 ### Dashboard
 
@@ -217,6 +230,11 @@ recall meaningless.
 **LSTM windows never span two engines.** A window that crosses the boundary
 splices one engine's failure onto another's healthy start.
 
+**SHAP contributions are read in the model's own units.** Random Forest
+attribution is in probability, XGBoost's is in log-odds and needs a sigmoid to
+become the number on screen. The two are not comparable side by side, and the
+code labels which is which rather than quietly mixing them.
+
 **Inference reuses the saved scaler.** The dashboard loads
 `models/scaler.joblib` rather than refitting. A refit would usually match, but
 "usually" is how a transform quietly drifts from the one the model trained on.
@@ -235,8 +253,10 @@ Four tabs:
   the model raised, how many engines are genuinely in the failure window, and
   how many were caught
 - **Engine N** — one engine's probability curve across its whole life, with the
-  alert threshold and the true failure onset both marked, plus raw sensor traces
-- **Model performance** — metrics table and feature importance
+  alert threshold and the true failure onset both marked, a SHAP breakdown of
+  which sensors drove that engine's score, plus raw sensor traces
+- **Model performance** — metrics table, impurity feature importance, and
+  fleet-wide SHAP importance behind a toggle
 - **Roadmap** — what is not built yet, stated plainly rather than mocked up
 
 Sidebar controls the model, the alert threshold, the selected engine, and
@@ -253,13 +273,13 @@ whether the page auto-reloads when `models/` changes.
 - 14-check verification suite
 - Random Forest and XGBoost classifiers with live training output
 - Inference layer shared by the dashboard and the planned Flask API
+- SHAP explanations, per prediction and fleet-wide
 - Streamlit dashboard
 
 **Not built yet**
 
 - `src/train_lstm.py` — RUL regression. The windowing that feeds it is already
   built and tested: 14,459 training sequences of shape (30, 17)
-- `src/explainability.py` — SHAP TreeExplainer
 - `src/alerts.py` — email alerts via `smtplib`
 - FD002 / FD004 extension with per-regime normalization
 
@@ -292,6 +312,7 @@ src/
   eda.py               figures and written summary
   train_classifier.py  RF + XGBoost with live training output
   inference.py         artifact loading and scoring, shared by UI and future API
+  explainability.py    SHAP attribution, per prediction and fleet-wide
 dashboard/
   app.py               Streamlit UI
 models/                trained artifacts, gitignored, regenerate by training

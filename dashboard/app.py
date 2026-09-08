@@ -9,8 +9,8 @@ src.inference. Retraining while the app is open is picked up automatically:
 the caches are keyed on the artifact file timestamps, and a background
 fragment watches those timestamps and reruns the app when they change.
 
-The RUL and SHAP panels are placeholders. Those models are not built yet and
-this file does not pretend otherwise.
+The RUL panel is a placeholder. That model is not built yet and this file
+does not pretend otherwise.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import config
+from src.explainability import MODEL_UNITS, explain, explain_engine
 from src.inference import (
     PROBABILITY_COLUMNS,
     Artifacts,
@@ -33,6 +34,7 @@ from src.inference import (
     artifacts_exist,
     engine_history,
     fleet_summary,
+    latest_per_engine,
     load_artifacts,
     load_scored_test,
 )
@@ -46,6 +48,8 @@ st.set_page_config(
 ALERT_COLOR = "#c1121f"
 OK_COLOR = "#2a6f97"
 
+TOWARDS_FAILURE = "towards failure"
+
 
 # ------------------------------------------------------ cached data access --
 
@@ -58,6 +62,42 @@ def cached_artifacts(signature: tuple) -> Artifacts:
 @st.cache_data(show_spinner="Scoring test engines...")
 def cached_scored(signature: tuple) -> pd.DataFrame:
     return load_scored_test(cached_artifacts(signature))
+
+
+@st.cache_data(show_spinner="Attributing this prediction to sensors...")
+def cached_engine_explanation(
+    signature: tuple, model_name: str, engine: int
+) -> tuple[pd.DataFrame, float, float, str]:
+    """One engine's SHAP drivers at its latest cycle.
+
+    Returns plain values rather than the Explanation object because
+    st.cache_data pickles what it stores, and a frame is cheaper to hold than
+    a fitted explainer.
+    """
+    artifacts = cached_artifacts(signature)
+    explanation = explain_engine(
+        artifacts, cached_scored(signature), engine, model_name
+    )
+    return (
+        explanation.contributions(),
+        explanation.base_value,
+        explanation.prediction(),
+        explanation.units,
+    )
+
+
+@st.cache_data(show_spinner="Computing SHAP importance across the fleet...")
+def cached_global_shap(signature: tuple, model_name: str) -> pd.DataFrame:
+    """Mean absolute contribution per sensor over every engine's latest cycle.
+
+    One row per engine rather than all 13,096 cycles: Random Forest
+    attribution costs about 0.15s per row, so the full split would take
+    half an hour. Cached until the next retrain.
+    """
+    artifacts = cached_artifacts(signature)
+    latest = latest_per_engine(cached_scored(signature))
+    importance = explain(artifacts, latest, model_name).global_importance()
+    return importance.rename_axis("feature").reset_index(name="importance")
 
 
 @st.fragment(run_every=5)
@@ -193,6 +233,60 @@ def render_engine(history: pd.DataFrame, probability_col: str,
     )
 
 
+def render_explanation(
+    contributions: pd.DataFrame,
+    base_value: float,
+    prediction: float,
+    units: str,
+    model_name: str,
+) -> None:
+    """Why this engine scored what it scored, one bar per sensor."""
+    st.markdown("##### Why this engine scored the way it did")
+
+    chart = (
+        alt.Chart(contributions)
+        .mark_bar()
+        .encode(
+            x=alt.X("shap_value:Q", title=f"Contribution ({units})"),
+            y=alt.Y("feature:N", sort=alt.EncodingSortField(
+                "shap_value", op="max", order="descending"), title=None),
+            color=alt.Color(
+                "direction:N",
+                scale=alt.Scale(
+                    domain=[TOWARDS_FAILURE, "towards healthy"],
+                    range=[ALERT_COLOR, OK_COLOR],
+                ),
+                title=None,
+            ),
+            tooltip=[
+                "feature",
+                alt.Tooltip("reading:Q", title="Raw reading", format=".3f"),
+                alt.Tooltip("shap_value:Q", title="Contribution", format="+.4f"),
+                "direction",
+            ],
+        )
+        .properties(height=420)
+    )
+    st.altair_chart(chart, width="stretch")
+
+    pushing_up = contributions[contributions["direction"] == TOWARDS_FAILURE]
+    leaders = ", ".join(pushing_up["feature"].head(3)) or "no sensor"
+    st.caption(
+        f"Red bars pushed this engine towards a failure prediction, blue "
+        f"pulled it back. They start from the fleet baseline of "
+        f"{base_value:+.4f} and sum to {prediction:+.4f} {units} — that is "
+        f"exactly the model's output for this engine, not an approximation. "
+        f"Chiefly {leaders}."
+    )
+    if units == "log-odds":
+        st.caption(
+            "XGBoost contributions are log-odds, so they add to a logit "
+            "rather than to the percentage shown above. Random Forest "
+            "contributions are in probability units. The two models' numbers "
+            "are not comparable side by side."
+        )
+
+
 def render_sensors(history: pd.DataFrame, feature_cols: list[str]) -> None:
     st.markdown("##### Sensor readings")
     default = [c for c in ("sensor_11", "sensor_4", "sensor_12") if c in feature_cols]
@@ -225,7 +319,9 @@ def render_sensors(history: pd.DataFrame, feature_cols: list[str]) -> None:
     st.altair_chart(chart)
 
 
-def render_performance(artifacts: Artifacts) -> None:
+def render_performance(
+    artifacts: Artifacts, signature: tuple, model_name: str
+) -> None:
     st.markdown("##### Held-out performance")
     metrics = artifacts.metrics_frame()
     st.dataframe(
@@ -256,32 +352,57 @@ def render_performance(artifacts: Artifacts) -> None:
     )
     st.altair_chart(chart, width="stretch")
     st.caption(
-        "Impurity-based importance. It is a rough guide, not an explanation. "
-        "SHAP replaces this once src/explainability.py exists."
+        "Impurity-based importance: how much each sensor reduced node impurity "
+        "while the forest was being built. It ranks sensors but says nothing "
+        "about direction, and it is biased towards high-cardinality features. "
+        "The SHAP view below is the trustworthy one."
     )
+
+    st.markdown(f"##### SHAP importance across the fleet ({model_name})")
+    if st.toggle(
+        "Compute fleet-wide SHAP",
+        key=f"global_shap_{model_name}",
+        help="Attribution over all 100 engines at their latest cycle. Random "
+             "Forest takes about 11 seconds; XGBoost is instant. Computed "
+             "once per trained model, then cached.",
+    ):
+        importance = cached_global_shap(signature, model_name)
+        chart = (
+            alt.Chart(importance)
+            .mark_bar(color=ALERT_COLOR)
+            .encode(
+                x=alt.X("importance:Q",
+                        title=f"Mean |contribution| ({MODEL_UNITS[model_name]})"),
+                y=alt.Y("feature:N", sort="-x", title=None),
+                tooltip=["feature",
+                         alt.Tooltip("importance:Q", format=".4f")],
+            )
+            .properties(height=420)
+        )
+        st.altair_chart(chart, width="stretch")
+        st.caption(
+            "Average size of each sensor's contribution, ignoring direction. "
+            "Unlike impurity importance this is measured on held-out engines "
+            "and is in the model's own output units."
+        )
+    else:
+        st.caption("Off by default so the page loads immediately.")
 
 
 def render_roadmap() -> None:
     st.markdown("##### Not built yet")
     st.info(
-        "This dashboard covers the classification branch only. Three panels "
-        "are still missing, each blocked on work that has not been done.",
+        "This dashboard covers the classification branch only. Two panels are "
+        "still missing, each blocked on work that has not been done.",
         icon="🧭",
     )
-    left, middle, right = st.columns(3)
+    left, right = st.columns(2)
     with left:
         st.markdown("**RUL estimate**")
         st.caption(
             "A predicted remaining-life figure per engine, from the LSTM. "
             "Blocked on `src/train_lstm.py`. The windowing that feeds it is "
             "already built and tested."
-        )
-    with middle:
-        st.markdown("**SHAP explanations**")
-        st.caption(
-            "Per-prediction attribution showing which sensors drove a given "
-            "alert. Blocked on `src/explainability.py`, and `shap` is not "
-            "installed yet."
         )
     with right:
         st.markdown("**Email alerts**")
@@ -346,9 +467,15 @@ def main() -> None:
         render_engine(
             history, probability_col, threshold, artifacts.failure_threshold
         )
+        contributions, base_value, prediction, units = cached_engine_explanation(
+            signature, model_name, engine
+        )
+        render_explanation(
+            contributions, base_value, prediction, units, model_name
+        )
         render_sensors(history, artifacts.feature_cols)
     with model_tab:
-        render_performance(artifacts)
+        render_performance(artifacts, signature, model_name)
     with next_tab:
         render_roadmap()
 
