@@ -62,5 +62,5 @@ Write-Host "Then train the models:"
 Write-Host "    python -m src.train_classifier" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Then launch the dashboard:"
-Write-Host "    streamlit run dashboard/app.py" -ForegroundColor Yellow
+Write-Host "    python -m api.server     (then open http://127.0.0.1:8050)" -ForegroundColor Yellow
 Write-Host ""

@@ -1,7 +1,8 @@
 # Predictive Maintenance for Industrial Equipment
 
 Failure prediction and Remaining Useful Life estimation on the NASA C-MAPSS
-turbofan engine dataset, with a live Streamlit dashboard.
+turbofan engine dataset, with a live web dashboard built around an interactive
+3D cutaway of the engine.
 
 Classical ML answers *"will this engine fail soon"*, an LSTM answers
 *"how many cycles remain"*. Everything runs locally, no cloud services.
@@ -20,7 +21,7 @@ Three commands from a clean clone:
 ```powershell
 .\setup.ps1                        # Windows
 python -m src.train_classifier     # trains RF + XGBoost, ~40 seconds
-streamlit run dashboard/app.py     # opens the dashboard
+python -m api.server               # then open http://127.0.0.1:8050
 ```
 
 On macOS or Linux use `bash setup.sh` for the first line.
@@ -73,7 +74,7 @@ Clone https://github.com/aarshnomorecool/predictive-maintenance-cmapss.git and s
 2. Install everything from requirements.txt into it
 3. Run `python verify_foundation.py` and confirm all 14 checks pass
 4. Run `python -m src.train_classifier` and report the final ROC-AUC and recall
-5. Tell me the command to launch the dashboard, but do not launch it yourself
+5. Tell me the command to launch the dashboard (`python -m api.server`), but do not launch it yourself
 
 The dataset is already in the repo under dataset-abstract/, do not download
 anything. Everything runs locally, do not add cloud or Colab dependencies.
@@ -104,7 +105,9 @@ Requires **Python 3.10 or newer**. Tested on 3.13.
 | `python verify_foundation.py` | 14 correctness checks over the data foundation |
 | `python -m src.train_classifier` | **Train RF + XGBoost**, live progress, saves to `models/` |
 | `python -m src.explainability` | SHAP attribution: which sensors drove a prediction |
-| `streamlit run dashboard/app.py` | **Launch the dashboard** |
+| `python -m src.sensor_health` | Per-sensor health calibration, and a check that the colour bands separate failing engines |
+| `python -m api.server` | **Launch the dashboard** at http://127.0.0.1:8050 |
+| `streamlit run dashboard/app.py` | The earlier, simpler Streamlit view |
 
 ### Training options
 
@@ -133,9 +136,17 @@ output.
 
 ### Dashboard
 
-Train before launching. If no models exist the dashboard says so and prints the
-command rather than erroring out. Retraining while the dashboard is open is
-picked up automatically within about 5 seconds, no restart needed.
+```bash
+python -m api.server
+```
+
+Then open http://127.0.0.1:8050. Train before launching. If no models exist the
+page says so and shows the command, then fills itself in once training
+finishes. Retraining while it is open is picked up within about 5 seconds, no
+restart or reload needed.
+
+Everything is served locally, including Three.js (vendored under `web/vendor/`),
+so the dashboard works with no internet connection.
 
 ---
 
@@ -154,7 +165,7 @@ A model that predicts "healthy" for everything scores 97%. Recall and ROC-AUC
 are the meaningful columns.
 
 Evaluated per engine at its latest cycle (the operationally realistic question,
-which is what the dashboard's Fleet tab shows), XGBoost at a 0.40 threshold
+which is what the dashboard's fleet list shows), XGBoost at a 0.40 threshold
 flags 26 engines, 25 are genuinely failing, and 22 are caught: **88% recall,
 85% precision**.
 
@@ -247,20 +258,49 @@ raise an error.
 
 ## Dashboard
 
-Four tabs:
+A Flask backend (`api/server.py`) serves a JSON API over the same inference,
+SHAP and sensor-health code the CLI tools use, plus a static frontend in `web/`.
+Nothing on screen is mocked: every number comes from the trained models and the
+C-MAPSS test split.
 
-- **Fleet** — every engine ranked by failure probability, with how many alerts
-  the model raised, how many engines are genuinely in the failure window, and
-  how many were caught
-- **Engine N** — one engine's probability curve across its whole life, with the
-  alert threshold and the true failure onset both marked, a SHAP breakdown of
-  which sensors drove that engine's score, plus raw sensor traces
-- **Model performance** — metrics table, impurity feature importance, and
-  fleet-wide SHAP importance behind a toggle
-- **Roadmap** — what is not built yet, stated plainly rather than mocked up
+**3D engine.** A cutaway of a two-spool high-bypass turbofan with every one of
+the 21 C-MAPSS channels placed at its measurement station (fan, bypass duct,
+LPC, HPC, combustor, HPT, LPT, nozzle), following Table 2 of Saxena et al. The
+geometry is illustrative, not a scan of a real engine, and the page says so.
+Drag to orbit, scroll to zoom, click a sensor to inspect it.
 
-Sidebar controls the model, the alert threshold, the selected engine, and
-whether the page auto-reloads when `models/` changes.
+**Sensor colours.** Each sensor's reading is placed on a scale from its healthy
+level to its failure level, both measured on training engines only:
+
+| Colour | Meaning |
+|---|---|
+| Green | Reads like a healthy engine (under 45% of the way to failure level) |
+| Amber | Drifting (45% to 75%) |
+| Red | Near the level engines reach in their last 10 cycles (75% and above) |
+| Grey | Too little signal: the sensor barely changes with wear (P15) |
+| Hollow | Not used by the models, reading is constant across the fleet |
+
+The bands are checked, not guessed: at their latest cycle, engines inside the
+failure window average 5.6 red sensors, engines outside it average 0.2
+(`python -m src.sensor_health` prints this).
+
+**Clicking a sensor** draws a leader-line callout on the engine with a severity
+bar, and the side panel shows the reading over the engine's whole run against
+its healthy and failure levels, its drift towards failure, and how much it
+moved the model's score at that cycle (SHAP).
+
+**Replay.** The play control and cycle slider step through the engine's
+recorded cycles. Sensor colours, risk, remaining life and SHAP drivers all
+follow the selected cycle, so you can watch an engine degrade.
+
+**Elsewhere on the page:** the fleet list ranked by risk with live alert counts,
+a model switch (Random Forest / XGBoost), an alert slider bounded to the range
+the selected model actually outputs, a model report with held-out metrics, and
+a station strip under the engine that doubles as a keyboard-accessible way to
+pick sensors. The URL names the engine and sensor on screen, so any view can be
+bookmarked.
+
+The earlier Streamlit view is still in `dashboard/app.py` for comparison.
 
 ---
 
@@ -272,9 +312,11 @@ whether the page auto-reloads when `models/` changes.
 - EDA with six figures and a written summary
 - 14-check verification suite
 - Random Forest and XGBoost classifiers with live training output
-- Inference layer shared by the dashboard and the planned Flask API
+- Inference layer shared by the dashboard, the API and the CLI tools
 - SHAP explanations, per prediction and fleet-wide
-- Streamlit dashboard
+- Per-sensor health scoring, calibrated on training engines
+- Flask API and web dashboard with the interactive 3D engine
+- Streamlit dashboard (earlier, simpler view)
 
 **Not built yet**
 
@@ -287,18 +329,17 @@ whether the page auto-reloads when `models/` changes.
 
 Stated openly rather than discovered during a demo:
 
-- The dashboard's alert-threshold slider spans 0.05 to 0.95, but XGBoost only
-  outputs roughly 0.06 to 0.93. At the extreme ends the slider degenerates:
-  0.05 flags all 100 engines, 0.95 flags none
-- The Fleet tab's "True RUL" column shows the *clipped* value. Eleven engines
-  display 125 when their real remaining life is 126 to 145 cycles
 - Random Forest probabilities are bimodal (34 of 100 engines sit at exactly
-  0.000 or 1.000), so the threshold slider feels coarse on RF and smooth on
+  0.000 or 1.000), so the alert slider feels coarse on RF and smooth on
   XGBoost
-- Auto-refresh on retrain is implemented and its file-signature logic is
-  verified, but the browser reload path has not been tested end to end
 - Training writes a 53 MB model file non-atomically, so a dashboard refresh
   landing mid-write could read a truncated file
+- The older Streamlit view still has a fixed 0.05 to 0.95 slider and shows
+  clipped true RUL. The web dashboard fixes both: its slider is bounded to the
+  selected model's real output range, and it shows unclipped remaining life
+- Sensor colours measure drift towards failure, not a fault diagnosis. A red
+  sensor means "reads like an engine near the end of its life", which is what
+  the data supports, not "this component has broken"
 
 ---
 
@@ -313,8 +354,17 @@ src/
   train_classifier.py  RF + XGBoost with live training output
   inference.py         artifact loading and scoring, shared by UI and future API
   explainability.py    SHAP attribution, per prediction and fleet-wide
+  sensor_health.py     per-sensor drift, severity bands, sensor metadata
+api/
+  server.py            Flask JSON API, serves the web dashboard
+web/
+  index.html           dashboard page
+  js/engine3d.js       procedural 3D turbofan and sensor markers
+  js/main.js           state, API calls, panels, replay, live sync
+  js/charts.js         SVG charts
+  vendor/              Three.js r170, so the page runs offline
 dashboard/
-  app.py               Streamlit UI
+  app.py               earlier Streamlit UI
 models/                trained artifacts, gitignored, regenerate by training
 reports/
   eda_summary.md
@@ -330,6 +380,7 @@ setup.ps1 / setup.sh   one-shot environment setup
 ## Tech stack
 
 Python · pandas · NumPy · scikit-learn · XGBoost · imbalanced-learn ·
-TensorFlow/Keras · Matplotlib · seaborn · Altair · Streamlit · SHAP · Flask
+TensorFlow/Keras · Matplotlib · seaborn · Altair · Streamlit · SHAP · Flask ·
+Three.js
 
 Everything runs on local CPU. No Colab, no cloud storage, no hosted training.

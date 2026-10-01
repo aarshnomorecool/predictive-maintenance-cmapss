@@ -58,6 +58,6 @@ Then train the models:
     python -m src.train_classifier
 
 Then launch the dashboard:
-    streamlit run dashboard/app.py
+    python -m api.server     (then open http://127.0.0.1:8050)
 
 DONE
