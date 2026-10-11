@@ -62,6 +62,12 @@
         <div class="gauge" id="gauge" aria-live="polite"></div>
       </div>
 
+      <div class="view-tabs" role="tablist" aria-label="View">
+        <button role="tab" id="tab-engine" data-view="engine" aria-selected="true">Engine</button>
+        <button role="tab" id="tab-space" data-view="space" aria-selected="false">Vector space</button>
+        <button role="tab" id="tab-network" data-view="network" aria-selected="false">Neural network</button>
+      </div>
+
       <div class="stage" id="stage">
         <svg class="callout-layer" id="callout-layer" aria-hidden="true"></svg>
         <div class="callout" id="callout" hidden></div>
@@ -77,6 +83,34 @@
           <li><i class="hollow" style="--c:var(--unmon)"></i>Not used by models</li>
         </ul>
         <p class="stage-note">Illustrative geometry. Sensor positions follow the C-MAPSS station map; colours are computed from the engine's recorded data.</p>
+      </div>
+
+      <div class="stage alt-stage" id="space-stage" hidden>
+        <div class="axis-label" id="axis-0"></div>
+        <div class="axis-label" id="axis-1"></div>
+        <div class="axis-label" id="axis-2"></div>
+        <div class="hover-tag" id="space-tag" hidden></div>
+        <div class="stage-tools">
+          <button class="ghost small" id="space-reset" type="button">Reset view</button>
+        </div>
+        <div class="life-scale" aria-label="Point colour: cycles the engine had left">
+          <span>Cycles left</span>
+          <div class="life-ramp"></div>
+          <div class="life-ticks"><span>0</span><span>35</span><span>80</span><span>125+</span></div>
+        </div>
+        <p class="stage-note" id="space-note"></p>
+      </div>
+
+      <div class="stage alt-stage" id="net-stage" hidden>
+        <div class="hover-tag" id="net-tag" hidden></div>
+        <div class="stage-tools bottom">
+          <button class="ghost small" id="net-replay" type="button">Replay data flow</button>
+        </div>
+        <div class="value-scale">
+          <span><i style="background:rgb(31,95,173)"></i>Positive value</span>
+          <span><i style="background:rgb(224,138,0)"></i>Negative value</span>
+          <span>Stronger colour, larger value. Darker line, stronger trained weight.</span>
+        </div>
       </div>
 
       <ol class="stations" id="stations" aria-label="Engine stations, front to back"></ol>

@@ -1,5 +1,7 @@
 ﻿import { EngineView, SEVERITY_COLORS, MODULE_ORDER } from "./engine3d.js";
 import { lineChart, divergingBars, formatValue } from "./charts.js";
+import { SpaceView, AXIS_LABEL_POSITIONS, lifeColor } from "./vectorspace.js";
+import { NetworkView } from "./network.js";
 
 const $ = (id) => document.getElementById(id);
 const POLL_MS = 5000;
@@ -26,6 +28,11 @@ const state = {
   cycleIndex: 0,
   playing: false,
   token: null,
+  viewMode: "engine",      // engine | space | network
+  space: null,             // /api/space, loaded on first visit to the tab
+  engineSpace: null,       // /api/engine/:id/space for the selected engine
+  network: null,           // /api/network structure
+  activations: null,       // /api/engine/:id/network at the current cycle
 };
 
 // ---------------------------------------------------------------- api ----
@@ -583,8 +590,203 @@ function renderShap() {
 }
 
 function renderDetail() {
-  if (state.selectedSensor) renderSensorDetail();
+  if (state.viewMode === "space") renderSpaceDetail();
+  else if (state.viewMode === "network") renderNetworkDetail();
+  else if (state.selectedSensor) renderSensorDetail();
   else renderEngineDetail();
+}
+
+// ------------------------------------------------------- vector space ----
+
+const spaceView = new SpaceView($("space-stage"), {
+  onHover: (hit) => {
+    const tag = $("space-tag");
+    if (!hit || !state.space) { tag.hidden = true; return; }
+    const sp = state.space;
+    tag.textContent = `Training engine ${sp.unit[hit.index]}, cycle ${sp.cycle[hit.index]}: `
+      + (sp.life_left[hit.index] === 0 ? "failed at this cycle"
+        : `failed ${sp.life_left[hit.index]} cycle${sp.life_left[hit.index] === 1 ? "" : "s"} later`);
+    tag.style.left = `${hit.x}px`;
+    tag.style.top = `${hit.y}px`;
+    tag.hidden = false;
+  },
+});
+spaceView.setAxisLabels([0, 1, 2].map((k) => ({ el: $(`axis-${k}`), pos: AXIS_LABEL_POSITIONS[k] })));
+
+async function ensureSpace() {
+  if (!state.space) {
+    state.space = await api("/api/space");
+    spaceView.setReference(state.space);
+    const ev = state.space.explained_variance;
+    ev.forEach((v, k) => { $(`axis-${k}`).textContent = `PC${k + 1} (${(v * 100).toFixed(1)}% of variance)`; });
+    $("space-note").textContent = `Each dot is one cycle of one of the ${state.space.engines} training engines, `
+      + `placed by the LSTM's ${state.space.dims}-number summary of the ${state.meta.rul.window_size} cycles before it. `
+      + `The dark line is the selected test engine's path; blue lines join it to its ${state.space.neighbors} nearest neighbours.`;
+  }
+  if (!state.engineSpace || state.engineSpace.engine !== state.selectedEngine) {
+    const engine = state.selectedEngine;
+    const data = await api(`/api/engine/${engine}/space`);
+    if (engine !== state.selectedEngine) return;      // user moved on meanwhile
+    state.engineSpace = data;
+    spaceView.setEngine(data);
+  }
+  spaceView.setCycle(state.cycleIndex);
+}
+
+function renderSpaceDetail() {
+  const detail = $("detail");
+  const es = state.engineSpace, sp = state.space, e = state.engine;
+  if (!es || !sp || es.engine !== e.engine) {
+    detail.innerHTML = `<h2>Engines like this one</h2><p class="muted">Encoding engine ${e.engine}</p>`;
+    return;
+  }
+  const i = state.cycleIndex;
+  const rows = es.neighbors[i].map((ref, j) => {
+    const life = sp.life_left[ref];
+    return `<tr><td><span class="nb-swatch" style="background:#${lifeColor(life).getHexString()}"></span>
+      Engine ${sp.unit[ref]}, cycle ${sp.cycle[ref]}</td><td>${life}</td><td>${es.distances[i][j].toFixed(2)}</td></tr>`;
+  }).join("");
+  const base = state.meta.rul.metrics.MeanBaseline.test.rmse;
+  const kept = sp.explained_variance.reduce((a, b) => a + b, 0);
+  detail.innerHTML = `
+    <h2>Engines like this one</h2>
+    <p class="muted">Engine ${e.engine} at cycle ${e.cycles[i]}, compared with every cycle of the
+      ${sp.engines} training engines, which all ran to failure.</p>
+    <dl class="facts">
+      <div><dt>Neighbours' average</dt><dd>${lifeText(es.knn_life[i])}</dd></div>
+      <div><dt>LSTM predicts</dt><dd>${lifeText(e.predicted_rul[i])}</dd></div>
+      <div><dt>True life left</dt><dd>${e.true_rul[i]}</dd></div>
+    </dl>
+    <h3>${sp.neighbors} nearest neighbours</h3>
+    <table class="nb-table">
+      <thead><tr><th>Training engine at that moment</th><th>Cycles it had left</th><th>Distance</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p class="chart-caption">Distance is measured in the full ${sp.dims}-number space, not the 3D picture.
+      Neighbour averages are capped at ${state.meta.rul_ceiling}, like the LSTM's target.</p>
+    <h3>Does nearness mean anything?</h3>
+    <p>Averaging the ${sp.neighbors} nearest neighbours' remaining life predicts the 100 test engines with an
+      RMSE of <b>${sp.knn_test_rmse} cycles</b>, against ${sp.lstm_test_rmse} for the LSTM itself and
+      ${base.toFixed(2)} for guessing the average. Engines the LSTM places close together really are at a
+      similar stage of wear.</p>
+    <p class="muted">The 3D view is a PCA projection that keeps ${(kept * 100).toFixed(1)}% of the variance. The
+      first axis alone holds ${(sp.explained_variance[0] * 100).toFixed(0)}%, so each axis is stretched to the same
+      length to keep the cloud readable. Search is exact; an approximate index such as a vector database uses is
+      only worth it at millions of vectors, and this is ${sp.n.toLocaleString()}.</p>`;
+}
+
+// ----------------------------------------------------- neural network ----
+
+const netView = new NetworkView($("net-stage"), {
+  onHover: (hit) => {
+    const tag = $("net-tag");
+    if (!hit) { tag.hidden = true; return; }
+    tag.textContent = hit.text;
+    tag.style.left = `${hit.x}px`;
+    tag.style.top = `${hit.y}px`;
+    tag.hidden = false;
+  },
+});
+$("net-replay").addEventListener("click", () => netView.replayFlow());
+
+async function ensureNetwork() {
+  if (!state.network) {
+    state.network = await api("/api/network");
+    netView.setStructure(state.network);
+  }
+  requestActivations();
+}
+
+let activationTimer = null;
+let activationSeq = 0;
+function requestActivations() {
+  clearTimeout(activationTimer);
+  activationTimer = setTimeout(async () => {
+    const seq = ++activationSeq;
+    const cycle = state.engine.cycles[state.cycleIndex];
+    try {
+      const acts = await api(`/api/engine/${state.engine.engine}/network?cycle=${cycle}`);
+      if (seq !== activationSeq) return;
+      state.activations = acts;
+      netView.setActivations(acts, { fast: state.playing });
+      if (!state.playing) renderNetworkDetail();
+    } catch (err) {
+      showBanner(`Could not compute activations: ${err.message}`);
+    }
+  }, state.playing ? 60 : 120);
+}
+
+function renderNetworkDetail() {
+  const detail = $("detail");
+  const n = state.network, a = state.activations, e = state.engine;
+  if (!n) { detail.innerHTML = `<h2>Inside the LSTM</h2><p class="muted">Loading the network</p>`; return; }
+  const cycle = a ? a.cycle : e.cycles[state.cycleIndex];
+  const [l1, l2, d1] = n.layers;
+  detail.innerHTML = `
+    <h2>Inside the LSTM</h2>
+    <p class="muted">Engine ${e.engine} at cycle ${cycle}. Every coloured neuron is the number that layer really
+      computed for this engine; drag the cycle slider or press play to watch it change.</p>
+    <dl class="facts">
+      <div><dt>Predicted life left</dt><dd>${a ? lifeText(a.predicted_rul) : "–"}</dd></div>
+      <div><dt>Trained parameters</dt><dd>${n.parameters.toLocaleString()}</dd></div>
+      <div><dt>True life left</dt><dd>${e.true_rul[state.cycleIndex]}</dd></div>
+    </dl>
+    <h3>How a prediction flows</h3>
+    <ol class="layer-list">
+      <li><b>Input window</b>The last ${n.window_size} cycles of ${n.features.length} sensor and setting values,
+        scaled 0 to 1. Rows run from oldest (top) to latest (bottom); the outlined row is the latest cycle.</li>
+      <li><b>LSTM, ${l1.units} units</b>Reads the window one cycle at a time and carries a memory forward, so it
+        can see a trend, not just a snapshot. Shown: its output after the last cycle.</li>
+      <li><b>LSTM, ${l2.units} units</b>Compresses that into ${l2.units} numbers, the model's summary of the
+        engine's state. These are the vectors plotted in the Vector space tab.</li>
+      <li><b>Dense, ${d1.units} units (ReLU)</b>Combines the summary; negative results are cut to zero.</li>
+      <li><b>Output</b>One number between 0 and 1, multiplied by ${n.rul_ceiling} to give cycles left.</li>
+    </ol>
+    <p class="chart-caption">Lines show each neuron's strongest trained incoming connections: 3 per neuron into
+      the first LSTM and 4 into the second, so the structure is readable; the two Dense layers are drawn in full.
+      Each LSTM unit has four gates, summed into one strength. Recurrent connections, where a unit feeds itself
+      from one cycle to the next, are not drawn.</p>`;
+}
+
+// --------------------------------------------------------- view switch ----
+
+function setView(mode) {
+  if (mode !== "engine" && !state.meta?.rul) mode = "engine";
+  state.viewMode = mode;
+  for (const tab of document.querySelectorAll(".view-tabs [role=tab]")) {
+    tab.setAttribute("aria-selected", String(tab.dataset.view === mode));
+    tab.tabIndex = tab.dataset.view === mode ? 0 : -1;
+  }
+  $("stage").hidden = mode !== "engine";
+  $("stations").hidden = mode !== "engine";
+  $("space-stage").hidden = mode !== "space";
+  $("net-stage").hidden = mode !== "network";
+  if (mode === "space") spaceView.start(); else spaceView.stop();
+  updateHash();
+  renderDetail();
+  if (!state.engine) return;
+  if (mode === "space") ensureSpace().then(renderDetail).catch((err) => showBanner(`Vector space: ${err.message}`));
+  if (mode === "network") ensureNetwork().catch((err) => showBanner(`Network: ${err.message}`));
+}
+
+for (const tab of document.querySelectorAll(".view-tabs [role=tab]")) {
+  tab.addEventListener("click", () => setView(tab.dataset.view));
+}
+document.querySelector(".view-tabs").addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+  const tabs = [...document.querySelectorAll(".view-tabs [role=tab]:not(:disabled)")];
+  const next = tabs[(tabs.indexOf(document.activeElement) + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+  next.focus();
+  setView(next.dataset.view);
+});
+$("space-reset").addEventListener("click", () => spaceView.resetView());
+
+function syncViewAvailability() {
+  const ready = Boolean(state.meta?.rul);
+  for (const id of ["tab-space", "tab-network"]) {
+    $(id).disabled = !ready;
+    $(id).title = ready ? "" : "Train the LSTM first: python -m src.train_lstm";
+  }
 }
 
 // -------------------------------------------------------------- actions ----
@@ -594,6 +796,10 @@ function renderCycle({ detail = true } = {}) {
   renderViewerHead();
   renderStations();
   renderCallout();
+  if (state.viewMode === "space" && state.engineSpace?.engine === state.engine.engine) {
+    spaceView.setCycle(state.cycleIndex);
+  }
+  if (state.viewMode === "network" && state.network) requestActivations();
   if (detail) renderDetail();
   requestExplain();
 }
@@ -612,15 +818,18 @@ async function selectEngine(engine) {
   state.cycleIndex = state.engine.cycles.length - 1;
   $("cycle").max = state.cycleIndex;
   state.explain = null;
+  state.activations = null;
   renderFleet();
   renderCycle();
   updateHash();
+  if (state.viewMode === "space") ensureSpace().then(renderDetail).catch((err) => showBanner(`Vector space: ${err.message}`));
 }
 
 // The URL always names what is on screen, so a view can be bookmarked or shared.
 function updateHash() {
   const parts = [`engine=${state.selectedEngine}`];
   if (state.selectedSensor) parts.push(`sensor=${state.selectedSensor}`);
+  if (state.viewMode !== "engine") parts.push(`view=${state.viewMode}`);
   history.replaceState(null, "", `#${parts.join("&")}`);
 }
 
@@ -719,6 +928,9 @@ function setSync(kind, text) {
 async function loadAll({ keepSelection = false } = {}) {
   state.meta = await api("/api/meta");
   state.token = state.meta.token;
+  // A retrain changes the space and the weights, so drop what was cached
+  state.space = state.engineSpace = state.network = state.activations = null;
+  syncViewAvailability();
   view.setSensors(state.meta.sensors);
   renderModelSwitch();
   renderReport();
@@ -739,6 +951,8 @@ async function loadAll({ keepSelection = false } = {}) {
   const sensor = keepSelection ? state.selectedSensor : hashSensor;
   await selectEngine(engine);
   if (sensor) selectSensor(sensor);
+  const viewParam = keepSelection ? state.viewMode : hash.get("view");
+  setView(["space", "network"].includes(viewParam) ? viewParam : "engine");
   setSync("is-live", `Live, models trained ${new Date(state.meta.trained_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}`);
 }
 
@@ -767,6 +981,8 @@ async function poll() {
   try {
     await loadAll();
   } catch (err) {
+    state.token = null;
+    console.error(err);
     setSync("is-down", err.status === 503 ? "No trained models" : "Server unreachable");
     showBanner(err.status === 503
       ? "No trained models found. Train them with <code>python -m src.train_classifier</code>; this page reloads by itself when they appear."

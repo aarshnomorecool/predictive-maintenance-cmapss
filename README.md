@@ -108,6 +108,7 @@ Requires **Python 3.10 or newer**. Tested on 3.13.
 | `python -m src.train_classifier` | **Train RF + XGBoost**, live progress, saves to `models/` |
 | `python -m src.train_lstm` | **Train the remaining-life LSTM**, live progress, saves to `models/` |
 | `python -m src.explainability` | SHAP attribution: which sensors drove a prediction |
+| `python -m src.latent_space` | Checks the LSTM's vector space is meaningful: neighbour-based life estimate vs LSTM vs a constant guess |
 | `python -m src.sensor_health` | Per-sensor health calibration, and a check that the colour bands separate failing engines |
 | `python -m api.server` | **Launch the dashboard** at http://127.0.0.1:8050 |
 | `streamlit run dashboard/app.py` | The earlier, simpler Streamlit view |
@@ -331,6 +332,31 @@ bar, and the side panel shows the reading over the engine's whole run against
 its healthy and failure levels, its drift towards failure, and how much it
 moved the model's score at that cycle (SHAP).
 
+**Three tabs, one engine.** The centre panel switches between three views of
+the selected engine, all driven by the same replay slider:
+
+- **Engine** — the 3D cutaway with live sensor colours, described above
+- **Vector space** — a 3D point cloud of the LSTM's internal state. Each of
+  the 20,631 dots is one cycle of one training engine, placed by the 32
+  numbers the LSTM's second layer uses to summarise the 30 cycles before it,
+  projected to 3D with PCA (97.2% of the variance kept), and coloured by how
+  many cycles that engine really had left. Healthy engines sit at the green
+  end, failing ones at the red end, and the selected test engine draws its
+  path between them. Blue lines join it to its 8 nearest training
+  neighbours, and the side panel lists how long each of them lasted
+- **Neural network** — the trained LSTM drawn layer by layer (input window,
+  LSTM 64, LSTM 32, Dense 16, output), with lines weighted by the real
+  trained connection strengths and every neuron coloured by the value it
+  actually computed for this engine and cycle. Changing cycle sends a pulse
+  through the network from input to prediction
+
+The vector space is checked, not just drawn: averaging the remaining life of
+a test engine's 8 nearest training neighbours predicts it with RMSE 15.96
+cycles, against 13.58 for the LSTM and 40.69 for guessing the average
+(`python -m src.latent_space`). Neighbour search is exact. A vector database
+uses an approximate index because it holds millions of vectors; at 20,631 an
+exact search answers in milliseconds.
+
 **Replay.** The play control and cycle slider step through the engine's
 recorded cycles. Sensor colours, risk, remaining life and SHAP drivers all
 follow the selected cycle, so you can watch an engine degrade.
@@ -357,6 +383,8 @@ The earlier Streamlit view is still in `dashboard/app.py` for comparison.
 - LSTM remaining-life model (TensorFlow/Keras), scored with RMSE, MAE and the
   NASA PHM 2008 metric, shown live in the dashboard
 - Atomic model saves, so a dashboard refresh never reads a half-written file
+- Vector-space view of the LSTM's internal state with nearest-neighbour
+  search, and a live neural-network diagram showing data flowing through
 - Inference layer shared by the dashboard, the API and the CLI tools
 - SHAP explanations, per prediction and fleet-wide
 - Per-sensor health scoring, calibrated on training engines
@@ -405,6 +433,7 @@ src/
   inference.py         artifact loading and scoring, shared by UI and future API
   explainability.py    SHAP attribution, per prediction and fleet-wide
   sensor_health.py     per-sensor drift, severity bands, sensor metadata
+  latent_space.py      LSTM vectors, nearest-neighbour index, PCA, activations
 api/
   server.py            Flask JSON API, serves the web dashboard
 web/
@@ -412,6 +441,8 @@ web/
   js/engine3d.js       procedural 3D turbofan and sensor markers
   js/main.js           state, API calls, panels, replay, live sync
   js/charts.js         SVG charts
+  js/vectorspace.js    3D point cloud of the LSTM's vector space
+  js/network.js        neural-network diagram with data-flow animation
   vendor/              Three.js r170, so the page runs offline
 dashboard/
   app.py               earlier Streamlit UI

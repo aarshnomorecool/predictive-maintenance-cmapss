@@ -41,6 +41,15 @@ from src.inference import (
     lstm_signature,
     predict_rul_every_cycle,
 )
+from src.latent_space import (
+    N_NEIGHBORS,
+    LatentSpace,
+    build_latent_space,
+    connection_strengths,
+    encode_frame,
+    layer_model,
+)
+from src.preprocessing import apply_scaler, make_windows_every_cycle
 from src.sensor_health import (
     CRITICAL_LEVEL,
     SENSOR_SPECS,
@@ -71,6 +80,12 @@ class State:
     true_rul_at_end: dict[int, int]
     rul: RulArtifacts | None = None          # LSTM, optional until trained
     predicted_rul: pd.DataFrame | None = None  # unit, cycle, predicted_rul
+    space: LatentSpace | None = None          # training engines in LSTM space
+    test_vectors: np.ndarray | None = None    # every test cycle in LSTM space
+    test_index: pd.DataFrame | None = None    # unit, cycle for test_vectors rows
+    display_center: np.ndarray | None = None  # PCA coords -> [-1, 1] for drawing
+    display_scale: np.ndarray | None = None
+    layers: object = None                     # (keras model, layer list) for activations
 
 
 def combined_signature() -> tuple:
@@ -94,10 +109,18 @@ def state() -> State:
             scored = load_scored_test(artifacts)
             calibrations = calibrate(artifacts.feature_cols, artifacts.subset)
             truth = load_test_rul(artifacts.subset)
-            rul_artifacts, predicted = None, None
+            rul_artifacts, predicted, space = None, None, None
+            test_vectors = test_index = center = scale = layers = None
             if lstm_artifacts_exist():
                 rul_artifacts = load_rul_artifacts()
                 predicted = predict_rul_every_cycle(rul_artifacts, scored)
+                space = build_latent_space(rul_artifacts, artifacts.subset)
+                test_vectors, test_index = encode_frame(rul_artifacts, scored)
+                # Stretch each PCA axis to the same drawn size. PC1 alone holds
+                # 90% of the variance, so unscaled the cloud would be a thin line.
+                lo, hi = space.coords.min(axis=0), space.coords.max(axis=0)
+                center, scale = (lo + hi) / 2, np.maximum((hi - lo) / 2, 1e-9)
+                layers = layer_model(rul_artifacts.model)
             _state = State(
                 signature=signature,
                 artifacts=artifacts,
@@ -107,6 +130,12 @@ def state() -> State:
                 true_rul_at_end=dict(zip(truth[config.UNIT_COL], truth["true_rul_at_end"])),
                 rul=rul_artifacts,
                 predicted_rul=predicted,
+                space=space,
+                test_vectors=test_vectors,
+                test_index=test_index,
+                display_center=center,
+                display_scale=scale,
+                layers=layers,
             )
         return _state
 
@@ -304,6 +333,128 @@ def api_explain(engine: int):
              "reading": round(float(r.reading), 4)}
             for r in frame.itertuples()
         ],
+    )
+
+
+# ------------------------------------------------- vector space / network --
+
+def require_lstm(s: State) -> None:
+    if s.rul is None:
+        abort(503, description="No LSTM trained. Run: python -m src.train_lstm")
+
+
+def display_coords(s: State, coords: np.ndarray) -> np.ndarray:
+    return (coords - s.display_center) / s.display_scale
+
+
+@app.get("/api/space")
+def api_space():
+    """Every moment of every training engine, as a point in 3D."""
+    s = state()
+    require_lstm(s)
+    sp = s.space
+    xyz = display_coords(s, sp.coords)
+    # How well "average the neighbours' remaining life" predicts each test
+    # engine at its last cycle: evidence that nearness here means something.
+    last = (s.test_index.groupby(config.UNIT_COL).cumcount(ascending=False) == 0).to_numpy()
+    truth = latest_per_engine(s.scored)[config.RUL_COL].to_numpy()
+    knn = sp.knn_life_estimate(s.test_vectors[last])
+    return jsonify(
+        knn_test_rmse=round(float(np.sqrt(np.mean((knn - truth) ** 2))), 2),
+        lstm_test_rmse=round(float(s.rul.metadata["metrics"]["LSTM"]["test"]["rmse"]), 2),
+        n=len(sp.reference),
+        engines=int(sp.reference[config.UNIT_COL].nunique()),
+        dims=int(sp.vectors.shape[1]),
+        explained_variance=[round(v, 4) for v in sp.explained_variance],
+        neighbors=N_NEIGHBORS,
+        rul_ceiling=config.RUL_CLIP,
+        xyz=round_list(xyz.reshape(-1), 3),
+        life_left=[int(v) for v in sp.reference["life_left"]],
+        unit=[int(v) for v in sp.reference[config.UNIT_COL]],
+        cycle=[int(v) for v in sp.reference[config.CYCLE_COL]],
+    )
+
+
+@app.get("/api/engine/<int:engine>/space")
+def api_engine_space(engine: int):
+    """One test engine's path through the space, and its nearest training
+    neighbours at every cycle, so replay needs no further requests."""
+    s = state()
+    require_lstm(s)
+    mask = (s.test_index[config.UNIT_COL] == engine).to_numpy()
+    if not mask.any():
+        abort(404, description=f"Engine {engine} is not in the test split")
+    vectors = s.test_vectors[mask]
+    xyz = display_coords(s, s.space.project(vectors))
+    indices, distances = s.space.neighbors(vectors)
+    return jsonify(
+        engine=engine,
+        cycles=[int(c) for c in s.test_index.loc[mask, config.CYCLE_COL]],
+        xyz=round_list(xyz.reshape(-1), 3),
+        neighbors=indices.tolist(),
+        distances=[round_list(row, 3) for row in distances],
+        knn_life=round_list(s.space.knn_life_estimate(vectors), 1),
+    )
+
+
+@app.get("/api/network")
+def api_network():
+    """Layer sizes and trained connection strengths, scaled 0-1 per layer."""
+    s = state()
+    require_lstm(s)
+    layers = []
+    for layer in connection_strengths(s.rul.model):
+        w = layer["weights"]
+        layers.append({
+            "name": layer["name"], "kind": layer["kind"], "units": int(layer["units"]),
+            "weights": round_list((w / w.max()).reshape(-1), 3),
+            "shape": list(w.shape),
+        })
+    return jsonify(
+        parameters=int(s.rul.model.count_params()),
+        features=[SPEC_BY_COLUMN[c].symbol if c in SPEC_BY_COLUMN
+                  else c.replace("setting_", "Setting ") for c in s.rul.feature_cols],
+        window_size=s.rul.window_size,
+        layers=layers,
+        rul_ceiling=config.RUL_CLIP,
+    )
+
+
+@app.get("/api/engine/<int:engine>/network")
+def api_engine_network(engine: int):
+    """What every layer computed for one engine at one cycle."""
+    s = state()
+    require_lstm(s)
+    try:
+        history = engine_history(s.scored, engine)
+    except ValueError:
+        abort(404, description=f"Engine {engine} is not in the test split")
+    cycle = request.args.get("cycle", type=int, default=int(history[config.CYCLE_COL].iloc[-1]))
+    upto = history[history[config.CYCLE_COL] <= cycle]
+    if upto.empty:
+        abort(404, description=f"Engine {engine} has no cycle {cycle}")
+
+    scaled = apply_scaler(upto, s.rul.scaler, s.rul.feature_cols)
+    X, _ = make_windows_every_cycle(scaled, s.rul.feature_cols, s.rul.window_size)
+    model, layer_list = s.layers
+    outputs = model.predict(X[-1:], verbose=0)
+    values = []
+    for layer, out in zip(layer_list, outputs):
+        out = np.asarray(out)[0]
+        entry = {"name": layer.name, "kind": type(layer).__name__}
+        if out.ndim == 2:              # LSTM returning a sequence: (time, units)
+            entry["sequence"] = round_list(out.reshape(-1), 3)
+            entry["shape"] = list(out.shape)
+            out = out[-1]
+        entry["values"] = round_list(out, 4)
+        values.append(entry)
+    return jsonify(
+        engine=engine,
+        cycle=int(upto[config.CYCLE_COL].iloc[-1]),
+        input=round_list(X[-1].reshape(-1), 3),
+        input_shape=list(X[-1].shape),
+        layers=values,
+        predicted_rul=round(float(np.clip(values[-1]["values"][0] * config.RUL_CLIP, 0, config.RUL_CLIP)), 1),
     )
 
 

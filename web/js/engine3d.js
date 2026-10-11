@@ -414,6 +414,7 @@ export class EngineView {
 
   frame() {
     const dt = Math.min(this.clock.getDelta(), 0.05);
+    if (!this.container.offsetParent) return;      // tab hidden
     const t = this.clock.elapsedTime;
 
     if (!this.reducedMotion) {
