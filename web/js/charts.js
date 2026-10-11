@@ -39,12 +39,13 @@ export function formatValue(v, digits) {
  *   refs: [{ y, label, color, dash }]  horizontal reference lines
  *   bands: [{ from, to, color }]       horizontal shaded bands (y ranges)
  *   spans: [{ from, to, color, label }] vertical shaded spans (x ranges)
+ *   extra: [{ y, color, dash, label }] further series on the same axes
  *   marker: number                     index of the current cycle
  *   format: (v) => string              value formatter for the hover readout
  *   height: number
  */
 export function lineChart(container, options) {
-  const { x, y, color = "#1f5fad", refs = [], bands = [], spans = [],
+  const { x, y, color = "#1f5fad", refs = [], bands = [], spans = [], extra = [],
           marker, format = (v) => formatValue(v), height = 168 } = options;
   container.replaceChildren();
   const width = Math.max(container.clientWidth, 240);
@@ -52,7 +53,8 @@ export function lineChart(container, options) {
   const w = width - m.left - m.right;
   const h = height - m.top - m.bottom;
 
-  let [lo, hi] = options.yDomain || [Math.min(...y), Math.max(...y)];
+  const everything = [y, ...extra.map((s) => s.y)].flat().filter(Number.isFinite);
+  let [lo, hi] = options.yDomain || [Math.min(...everything), Math.max(...everything)];
   if (!options.yDomain) {
     for (const r of refs) { lo = Math.min(lo, r.y); hi = Math.max(hi, r.y); }
     const pad = (hi - lo || Math.abs(hi) || 1) * 0.08;
@@ -89,8 +91,13 @@ export function lineChart(container, options) {
     }
   }
 
-  const d = x.map((xv, i) => `${i ? "L" : "M"}${sx(xv).toFixed(1)},${sy(clampY(y[i])).toFixed(1)}`).join("");
-  el("path", { d, fill: "none", stroke: color, class: "chart-line" }, svg);
+  const pathFor = (values) => x.map((xv, i) =>
+    `${i ? "L" : "M"}${sx(xv).toFixed(1)},${sy(clampY(values[i])).toFixed(1)}`).join("");
+  for (const s of extra) {
+    el("path", { d: pathFor(s.y), fill: "none", stroke: s.color, "stroke-dasharray": s.dash || "none",
+                 class: "chart-line" }, svg);
+  }
+  el("path", { d: pathFor(y), fill: "none", stroke: color, class: "chart-line" }, svg);
 
   if (marker != null && marker >= 0 && marker < x.length) {
     const mx = sx(x[marker]);
@@ -113,7 +120,8 @@ export function lineChart(container, options) {
       const hx = sx(x[i]);
       hLine.setAttribute("x1", hx); hLine.setAttribute("x2", hx);
       hDot.setAttribute("cx", hx); hDot.setAttribute("cy", sy(clampY(y[i])));
-      hText.textContent = `Cycle ${x[i]}: ${format(y[i])}`;
+      hText.textContent = `Cycle ${x[i]}: ${options.seriesLabel ? options.seriesLabel + " " : ""}${format(y[i])}`
+        + extra.map((s) => `, ${s.label} ${format(s.y[i])}`).join("");
       const right = hx > m.left + w * 0.6;
       hText.setAttribute("x", right ? hx - 8 : hx + 8);
       hText.setAttribute("text-anchor", right ? "end" : "start");

@@ -29,6 +29,7 @@ from sklearn.metrics import (
 from xgboost import XGBClassifier
 
 from src import config
+from src.artifact_io import atomic_save, atomic_write_text
 from src.preprocessing import prepare_all
 
 RULE = "=" * 78
@@ -199,9 +200,12 @@ def main() -> None:
         }
 
         config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        joblib.dump(rf, config.MODELS_DIR / "rf_classifier.joblib")
-        joblib.dump(xgb, config.MODELS_DIR / "xgb_classifier.joblib")
-        joblib.dump(scaler, config.MODELS_DIR / "scaler.joblib")
+        # Atomic writes: the dashboard may be reading these files right now.
+        for obj, name in ((rf, "rf_classifier.joblib"),
+                          (xgb, "xgb_classifier.joblib"),
+                          (scaler, "scaler.joblib")):
+            atomic_save(config.MODELS_DIR / name,
+                        lambda path, obj=obj: joblib.dump(obj, path))
 
         importances = dict(
             zip(tabular.feature_cols, rf.feature_importances_.tolist())
@@ -220,9 +224,10 @@ def main() -> None:
             "train_units": dataset.train_units,
             "val_units": dataset.val_units,
         }
-        (config.MODELS_DIR / "classifier_metadata.json").write_text(
-            json.dumps(metadata, indent=2), encoding="utf-8"
-        )
+        # Metadata last: the dashboard keys its reload on these timestamps,
+        # so by the time this lands every model file is already complete.
+        atomic_write_text(config.MODELS_DIR / "classifier_metadata.json",
+                          json.dumps(metadata, indent=2))
         for name in ("rf_classifier.joblib", "xgb_classifier.joblib",
                      "scaler.joblib", "classifier_metadata.json"):
             print(f"  saved  models/{name}", flush=True)

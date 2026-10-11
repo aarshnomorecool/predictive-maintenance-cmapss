@@ -20,7 +20,7 @@ import pandas as pd
 
 from src import config
 from src.data_pipeline import build_dataset
-from src.preprocessing import apply_scaler
+from src.preprocessing import apply_scaler, make_windows_every_cycle
 
 RF_FILE = "rf_classifier.joblib"
 XGB_FILE = "xgb_classifier.joblib"
@@ -180,6 +180,88 @@ def fleet_summary(
     return summary.sort_values(
         "failure_probability", ascending=False
     ).reset_index(drop=True)
+
+
+# ------------------------------------------------------- RUL regression ----
+
+LSTM_MODEL_FILE = "lstm_rul.keras"
+LSTM_SCALER_FILE = "lstm_scaler.joblib"
+LSTM_METADATA_FILE = "lstm_metadata.json"
+LSTM_FILES = (LSTM_MODEL_FILE, LSTM_SCALER_FILE, LSTM_METADATA_FILE)
+
+
+def lstm_paths() -> list[Path]:
+    return [config.MODELS_DIR / name for name in LSTM_FILES]
+
+
+def lstm_artifacts_exist() -> bool:
+    return all(path.exists() for path in lstm_paths())
+
+
+def lstm_signature() -> tuple:
+    return tuple(
+        (path.name, path.stat().st_mtime_ns if path.exists() else 0)
+        for path in lstm_paths()
+    )
+
+
+@dataclass
+class RulArtifacts:
+    """Everything produced by src.train_lstm, loaded back."""
+
+    model: object
+    scaler: object
+    metadata: dict
+    trained_at: pd.Timestamp
+
+    @property
+    def feature_cols(self) -> list[str]:
+        return list(self.metadata["feature_cols"])
+
+    @property
+    def window_size(self) -> int:
+        return int(self.metadata["window_size"])
+
+    @property
+    def is_quick_run(self) -> bool:
+        return bool(self.metadata.get("quick_run", False))
+
+
+def load_rul_artifacts() -> RulArtifacts:
+    """Load the LSTM. TensorFlow is imported here, not at module import,
+    so tools that only need the classifiers do not pay its start-up cost."""
+    missing = [path.name for path in lstm_paths() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing {', '.join(missing)} in {config.MODELS_DIR}. "
+            "Run: python -m src.train_lstm"
+        )
+    import os
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    import tensorflow as tf
+
+    metadata_path = config.MODELS_DIR / LSTM_METADATA_FILE
+    return RulArtifacts(
+        model=tf.keras.models.load_model(config.MODELS_DIR / LSTM_MODEL_FILE),
+        scaler=joblib.load(config.MODELS_DIR / LSTM_SCALER_FILE),
+        metadata=json.loads(metadata_path.read_text(encoding="utf-8")),
+        trained_at=pd.Timestamp(metadata_path.stat().st_mtime, unit="s"),
+    )
+
+
+def predict_rul_every_cycle(rul: RulArtifacts, raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Predicted RUL at every cycle of every engine in ``raw_df``.
+
+    Returns columns unit, cycle, predicted_rul. Scales with the LSTM's own
+    training-time scaler, as with the classifiers.
+    """
+    scaled = apply_scaler(raw_df, rul.scaler, rul.feature_cols)
+    X, index = make_windows_every_cycle(scaled, rul.feature_cols, rul.window_size)
+    raw = rul.model.predict(X, batch_size=2048, verbose=0).reshape(-1)
+    clip = float(rul.metadata["rul_clip"])
+    index = index.copy()
+    index["predicted_rul"] = np.clip(raw * clip, 0, clip)
+    return index
 
 
 def engine_history(scored: pd.DataFrame, engine: int) -> pd.DataFrame:

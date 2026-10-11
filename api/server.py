@@ -29,12 +29,17 @@ from src.explainability import MODEL_UNITS, explain
 from src.inference import (
     PROBABILITY_COLUMNS,
     Artifacts,
+    RulArtifacts,
     artifact_signature,
     artifacts_exist,
     engine_history,
     latest_per_engine,
     load_artifacts,
+    load_rul_artifacts,
     load_scored_test,
+    lstm_artifacts_exist,
+    lstm_signature,
+    predict_rul_every_cycle,
 )
 from src.sensor_health import (
     CRITICAL_LEVEL,
@@ -64,6 +69,13 @@ class State:
     drift: pd.DataFrame           # per-cycle drift for every scored sensor
     calibrations: dict[str, Calibration]
     true_rul_at_end: dict[int, int]
+    rul: RulArtifacts | None = None          # LSTM, optional until trained
+    predicted_rul: pd.DataFrame | None = None  # unit, cycle, predicted_rul
+
+
+def combined_signature() -> tuple:
+    """Classifier and LSTM files together, so retraining either reloads."""
+    return artifact_signature() + lstm_signature()
 
 
 _state: State | None = None
@@ -75,20 +87,26 @@ def state() -> State:
     global _state
     if not artifacts_exist():
         abort(503, description="No trained models. Run: python -m src.train_classifier")
-    signature = artifact_signature()
+    signature = combined_signature()
     with _lock:
         if _state is None or _state.signature != signature:
             artifacts = load_artifacts()
             scored = load_scored_test(artifacts)
             calibrations = calibrate(artifacts.feature_cols, artifacts.subset)
-            rul = load_test_rul(artifacts.subset)
+            truth = load_test_rul(artifacts.subset)
+            rul_artifacts, predicted = None, None
+            if lstm_artifacts_exist():
+                rul_artifacts = load_rul_artifacts()
+                predicted = predict_rul_every_cycle(rul_artifacts, scored)
             _state = State(
                 signature=signature,
                 artifacts=artifacts,
                 scored=scored,
                 drift=score_history(scored, calibrations),
                 calibrations=calibrations,
-                true_rul_at_end=dict(zip(rul[config.UNIT_COL], rul["true_rul_at_end"])),
+                true_rul_at_end=dict(zip(truth[config.UNIT_COL], truth["true_rul_at_end"])),
+                rul=rul_artifacts,
+                predicted_rul=predicted,
             )
         return _state
 
@@ -123,7 +141,7 @@ def round_list(values, digits: int = 4) -> list[float]:
 def api_signature():
     if not artifacts_exist():
         return jsonify(ready=False, token=None)
-    return jsonify(ready=True, token=signature_token(artifact_signature()))
+    return jsonify(ready=True, token=signature_token(combined_signature()))
 
 
 @app.get("/api/meta")
@@ -146,7 +164,20 @@ def api_meta():
             "signal_to_noise": round(cal.signal_to_noise, 2) if cal else None,
         })
     metrics = a.metrics_frame().round(4).to_dict(orient="records")
+    rul = None
+    if s.rul is not None:
+        rul = {
+            "trained_at": s.rul.trained_at.isoformat(),
+            "quick_run": s.rul.is_quick_run,
+            "window_size": s.rul.window_size,
+            "best_epoch": s.rul.metadata["best_epoch"],
+            "epochs_run": s.rul.metadata["epochs_run"],
+            "metrics": s.rul.metadata["metrics"],
+            "history": s.rul.metadata["history"],
+        }
     return jsonify(
+        rul=rul,
+        rul_ceiling=config.RUL_CLIP,
         token=signature_token(s.signature),
         subset=a.subset,
         trained_at=a.trained_at.isoformat(),
@@ -170,6 +201,10 @@ def api_fleet():
     probability_col = PROBABILITY_COLUMNS[model]
     latest = latest_per_engine(s.scored)
     latest_drift = latest_per_engine(s.drift).set_index(config.UNIT_COL)
+    predicted_at_end = (
+        latest_per_engine(s.predicted_rul).set_index(config.UNIT_COL)["predicted_rul"]
+        if s.predicted_rul is not None else None
+    )
     informative = [c for c, cal in s.calibrations.items() if cal.informative]
 
     engines = []
@@ -182,6 +217,8 @@ def api_fleet():
             "cycles": int(row[config.CYCLE_COL]),
             "probability": round(float(row[probability_col]), 4),
             "true_rul": int(s.true_rul_at_end[engine]),
+            "predicted_rul": (round(float(predicted_at_end[engine]), 1)
+                              if predicted_at_end is not None else None),
             "in_failure_window": bool(row[config.LABEL_COL]),
             "critical_sensors": int((drifts >= CRITICAL_LEVEL).sum()),
             "warning_sensors": int(((drifts >= WARNING_LEVEL) & (drifts < CRITICAL_LEVEL)).sum()),
@@ -213,6 +250,11 @@ def api_engine(engine: int):
             "failure_level": round(cal.failure_mean, 4),
             "severity": severity(float(drift_values[-1]), cal.informative),
         }
+    predicted = None
+    if s.predicted_rul is not None:
+        own = s.predicted_rul[s.predicted_rul[config.UNIT_COL] == engine]
+        predicted = round_list(
+            own.set_index(config.CYCLE_COL)["predicted_rul"].reindex(cycles), 1)
     flat = {
         column: round(float(history[column].iloc[-1]), 4)
         for column in config.SENSOR_COLS if column not in s.calibrations
@@ -223,6 +265,7 @@ def api_engine(engine: int):
         cycles=[int(c) for c in cycles],
         probability=round_list(history[PROBABILITY_COLUMNS[model]], 4),
         true_rul=[int(v) for v in unclipped_rul(s, engine, cycles, last_cycle)],
+        predicted_rul=predicted,
         in_failure_window=[bool(v) for v in history[config.LABEL_COL]],
         sensors=sensors,
         flat_sensors=flat,

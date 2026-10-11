@@ -191,6 +191,37 @@ def make_last_windows(
     )
 
 
+def make_windows_every_cycle(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    window_size: int = config.WINDOW_SIZE,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """One window ending at every recorded cycle of every engine.
+
+    Used to draw an engine's predicted RUL across its whole run. Cycles before
+    the window fills are front-padded by repeating the engine's first cycle,
+    the same rule make_last_windows uses, and windows never span two engines.
+
+    Returns ``(X, index)`` where ``index`` holds the unit and cycle each window
+    ends at, in the same order as ``X``.
+    """
+    sequences: list[np.ndarray] = []
+    index_parts: list[pd.DataFrame] = []
+    for _, unit_df in df.groupby(config.UNIT_COL, sort=True):
+        unit_df = unit_df.sort_values(config.CYCLE_COL)
+        values = unit_df[feature_cols].to_numpy(dtype=np.float32)
+        padded = np.vstack([np.repeat(values[:1], window_size - 1, axis=0), values])
+        # windows[i] covers padded[i : i + window_size], ending at real cycle i
+        windows = np.lib.stride_tricks.sliding_window_view(
+            padded, (window_size, len(feature_cols)))[:, 0]
+        sequences.append(windows)
+        index_parts.append(unit_df[[config.UNIT_COL, config.CYCLE_COL]])
+    return (
+        np.concatenate(sequences).astype(np.float32),
+        pd.concat(index_parts, ignore_index=True),
+    )
+
+
 # -------------------------------------------------------------- bundles -----
 
 @dataclass

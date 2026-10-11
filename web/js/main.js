@@ -88,6 +88,10 @@ function driftBar(drift) {
 }
 
 const probabilityAt = (i) => state.engine.probability[i];
+const hasRul = () => Array.isArray(state.engine?.predicted_rul);
+// The LSTM is trained on RUL capped at 125, so its top value means
+// "125 or more", not exactly 125.
+const lifeText = (v) => (v >= state.meta.rul_ceiling - 0.5 ? `${state.meta.rul_ceiling}+` : `${Math.round(v)}`);
 const isAlert = (p) => p >= state.threshold;
 
 // --------------------------------------------------------- 3D viewer ----
@@ -221,7 +225,31 @@ function renderReport() {
     <p class="muted" style="margin-top:0.8rem">Test engines stop well before failure, so only 2.5% of test cycles are
       failing. Accuracy is high for any model on data like that; recall and ROC-AUC are the numbers to read.</p>
     <p class="muted">Not used by the models, because their readings do not vary across the fleet:
-      ${m.dropped_cols.join(", ")}.</p>`;
+      ${m.dropped_cols.join(", ")}.</p>
+    ${m.rul ? rulReport(m.rul) : `<h3 style="margin-top:1.2rem">Remaining life (LSTM)</h3>
+      <p class="muted">Not trained yet. Run <code>python -m src.train_lstm</code>.</p>`}`;
+}
+
+function rulReport(r) {
+  const row = (name, split, s) => `<tr><td>${name}</td><td>${split}</td><td>${s.rmse.toFixed(2)}</td>
+    <td>${s.mae.toFixed(2)}</td><td><b>${s.nasa_score.toFixed(1)}</b></td><td>${(s.late_fraction * 100).toFixed(0)}%</td></tr>`;
+  return `
+    <h3 style="margin-top:1.2rem">Remaining life (LSTM)</h3>
+    <p class="muted">Predicts cycles left from the last ${r.window_size} cycles of all sensors. Weights from epoch
+      ${r.best_epoch} of ${r.epochs_run}, chosen on the validation engines. Trained ${new Date(r.trained_at).toLocaleString()}.</p>
+    <table class="metrics">
+      <thead><tr><th>Model</th><th>Split</th><th>RMSE</th><th>MAE</th><th>NASA score</th><th>Predicted late</th></tr></thead>
+      <tbody>
+        ${row("LSTM", "test", r.metrics.LSTM.test)}
+        ${row("LSTM", "val (every window)", r.metrics.LSTM.val_all_windows)}
+        ${row("Average-life guess", "test", r.metrics.MeanBaseline.test)}
+      </tbody>
+    </table>
+    <p class="muted" style="margin-top:0.8rem">RMSE and MAE are in cycles, on the 100 test engines at their last
+      recorded cycle. The NASA score is the PHM 2008 challenge metric: it punishes predicting failure too late
+      harder than too early, and lower is better. The average-life guess predicts the same number for every
+      engine, so beating it shows the LSTM learned from the sensors.</p>
+    ${r.quick_run ? `<p class="muted"><b>This LSTM came from a --quick smoke run; its scores are not meaningful.</b></p>` : ""}`;
 }
 
 // -------------------------------------------------------------- fleet ----
@@ -241,7 +269,7 @@ function renderFleet() {
   let rows = state.fleet.filter((e) => !query || String(e.engine).startsWith(query));
   rows = [...rows].sort((a, b) =>
     sort === "engine" ? a.engine - b.engine :
-    sort === "rul" ? a.true_rul - b.true_rul :
+    sort === "rul" ? (a.predicted_rul ?? a.true_rul) - (b.predicted_rul ?? b.true_rul) :
     b.probability - a.probability);
 
   const list = $("fleet-list");
@@ -254,7 +282,7 @@ function renderFleet() {
     li.dataset.engine = e.engine;
     li.setAttribute("aria-selected", String(e.engine === state.selectedEngine));
     li.innerHTML = `
-      <span class="fleet-id">#${e.engine}<small>${e.true_rul} left</small></span>
+      <span class="fleet-id" title="${e.predicted_rul == null ? "" : `LSTM predicts ${lifeText(e.predicted_rul)} cycles left; `}true value ${e.true_rul}">#${e.engine}<small>${e.predicted_rul == null ? `${e.true_rul} true` : `~${lifeText(e.predicted_rul)} left`}</small></span>
       <span class="prob">
         <span class="prob-track"><span class="prob-fill" style="width:${e.probability * 100}%"></span></span>
         <span class="prob-text">${(e.probability * 100).toFixed(1)}% risk</span>
@@ -327,6 +355,7 @@ function renderViewerHead() {
     `${red} sensors near failure level, ${amber} drifting. Scored by ${MODEL_LABELS[state.model]}.`;
   $("gauge").innerHTML = `
     <div class="${alert ? "status-alert" : "status-ok"}"><dt>Failure risk</dt><dd>${(p * 100).toFixed(1)}%</dd></div>
+    ${hasRul() ? `<div><dt>Predicted life left</dt><dd>${lifeText(e.predicted_rul[i])} cycles</dd></div>` : ""}
     <div><dt>True life left</dt><dd>${e.true_rul[i]} cycles</dd></div>
     <div class="${alert ? "status-alert" : "status-ok"}"><dt>Status</dt><dd>${alert ? "Inspect" : "Normal"}</dd></div>`;
   $("cycle-readout").textContent = `Cycle ${e.cycles[i]} of ${e.cycles[e.cycles.length - 1]}`;
@@ -354,8 +383,20 @@ function renderEngineDetail() {
     <dl class="facts">
       <div><dt>Failure risk</dt><dd>${(p * 100).toFixed(1)}%</dd></div>
       <div><dt>True life left</dt><dd>${e.true_rul[i]}</dd></div>
-      <div><dt>Alert level</dt><dd>${(state.threshold * 100).toFixed(0)}%</dd></div>
+      ${hasRul()
+        ? `<div><dt>Predicted life left</dt><dd>${lifeText(e.predicted_rul[i])}</dd></div>`
+        : `<div><dt>Alert level</dt><dd>${(state.threshold * 100).toFixed(0)}%</dd></div>`}
     </dl>
+    ${hasRul() ? `
+    <h3>Remaining life, predicted and true</h3>
+    <div id="rul-chart"></div>
+    <p class="chart-caption">Solid line is the LSTM's prediction from the last ${state.meta.rul.window_size} cycles of
+      sensor data; dashed line is the true remaining life. The model was trained with life capped at
+      ${state.meta.rul_ceiling} cycles, because early wear does not show in the sensors yet. Early in a run it
+      predicts just under ${state.meta.rul_ceiling} however long the engine really has, then tracks the true line
+      once degradation becomes visible.</p>` : `
+    <p class="muted" style="margin-top:1rem">No remaining-life model yet. Train it with
+      <code>python -m src.train_lstm</code>; this panel fills in by itself.</p>`}
     <h3>Failure risk over the engine's run</h3>
     <div id="prob-chart"></div>
     <p class="chart-caption">Red band is where true remaining life is ${state.meta.failure_threshold} cycles or fewer, the
@@ -368,6 +409,20 @@ function renderEngineDetail() {
       <thead><tr><th>Sensor</th><th>Reading</th><th class="mini">Drift</th></tr></thead>
       <tbody id="sensor-rows"></tbody>
     </table>`;
+
+  if (hasRul()) {
+    lineChart($("rul-chart"), {
+      x: e.cycles, y: e.predicted_rul, color: "var(--cobalt)", marker: i,
+      yDomain: [0, Math.max(state.meta.rul_ceiling + 10, ...e.true_rul.slice(0, 1))],
+      extra: [{ y: e.true_rul, color: "var(--ink)", dash: "5 4", label: "true" }],
+      refs: [
+        { y: state.meta.rul_ceiling, label: "Model ceiling", color: "var(--graphite)", dash: "2 3" },
+        { y: state.meta.failure_threshold, label: "Failure window", color: "var(--crit)" },
+      ],
+      spans: failureSpans(), seriesLabel: "predicted", format: (v) => `${Math.round(v)}`,
+      label: "Predicted and true remaining life by cycle",
+    });
+  }
 
   lineChart($("prob-chart"), {
     x: e.cycles, y: e.probability, color: "var(--ink)", yDomain: [0, 1], marker: i,

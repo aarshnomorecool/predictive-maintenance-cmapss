@@ -16,11 +16,12 @@ Guide: Prof. H. M. Kubade
 
 ## Quick start
 
-Three commands from a clean clone:
+Four commands from a clean clone:
 
 ```powershell
 .\setup.ps1                        # Windows
 python -m src.train_classifier     # trains RF + XGBoost, ~40 seconds
+python -m src.train_lstm           # trains the remaining-life LSTM, ~1.5 minutes
 python -m api.server               # then open http://127.0.0.1:8050
 ```
 
@@ -74,7 +75,8 @@ Clone https://github.com/aarshnomorecool/predictive-maintenance-cmapss.git and s
 2. Install everything from requirements.txt into it
 3. Run `python verify_foundation.py` and confirm all 14 checks pass
 4. Run `python -m src.train_classifier` and report the final ROC-AUC and recall
-5. Tell me the command to launch the dashboard (`python -m api.server`), but do not launch it yourself
+5. Run `python -m src.train_lstm` and report the final test RMSE and NASA score
+6. Tell me the command to launch the dashboard (`python -m api.server`), but do not launch it yourself
 
 The dataset is already in the repo under dataset-abstract/, do not download
 anything. Everything runs locally, do not add cloud or Colab dependencies.
@@ -104,6 +106,7 @@ Requires **Python 3.10 or newer**. Tested on 3.13.
 | `python -m src.eda` | Write figures to `reports/figures/` and `reports/eda_summary.md` |
 | `python verify_foundation.py` | 14 correctness checks over the data foundation |
 | `python -m src.train_classifier` | **Train RF + XGBoost**, live progress, saves to `models/` |
+| `python -m src.train_lstm` | **Train the remaining-life LSTM**, live progress, saves to `models/` |
 | `python -m src.explainability` | SHAP attribution: which sensors drove a prediction |
 | `python -m src.sensor_health` | Per-sensor health calibration, and a check that the colour bands separate failing engines |
 | `python -m api.server` | **Launch the dashboard** at http://127.0.0.1:8050 |
@@ -121,6 +124,16 @@ python -m src.train_classifier --trees 500 --rounds 1000
 Training prints live validation ROC-AUC as it goes. Every number that scrolls
 past is a real score from a real partially-trained model, not a progress
 animation. Expect roughly 40 seconds for the default run.
+
+```bash
+python -m src.train_lstm               # default: up to 80 epochs, early stopping
+python -m src.train_lstm --quick       # ~5s smoke run, scores not meaningful
+python -m src.train_lstm --epochs 150 --patience 20
+```
+
+The LSTM prints validation RMSE in cycles after every epoch and keeps the
+weights from the best epoch. CPU only (TensorFlow has no GPU support on native
+Windows), about 2 seconds per epoch.
 
 ### Explaining a prediction
 
@@ -140,10 +153,11 @@ output.
 python -m api.server
 ```
 
-Then open http://127.0.0.1:8050. Train before launching. If no models exist the
-page says so and shows the command, then fills itself in once training
-finishes. Retraining while it is open is picked up within about 5 seconds, no
-restart or reload needed.
+Then open http://127.0.0.1:8050. Train the classifiers before launching. If no
+models exist the page says so and shows the command, then fills itself in once
+training finishes. The LSTM is optional: without it the dashboard works and
+the remaining-life panels say how to train it. Retraining either while the page
+is open is picked up within about 5 seconds, no restart or reload needed.
 
 Everything is served locally, including Three.js (vendored under `web/vendor/`),
 so the dashboard works with no internet connection.
@@ -168,6 +182,34 @@ Evaluated per engine at its latest cycle (the operationally realistic question,
 which is what the dashboard's fleet list shows), XGBoost at a 0.40 threshold
 flags 26 engines, 25 are genuinely failing, and 22 are caught: **88% recall,
 85% precision**.
+
+### Remaining useful life (LSTM)
+
+FD001 test set, 100 engines, predicted RUL at each engine's last recorded cycle:
+
+| Model | RMSE (cycles) | MAE (cycles) | NASA score |
+|---|---|---|---|
+| LSTM | **13.58** | **10.61** | **288.0** |
+| Average-life guess | 40.69 | 35.00 | 19,887.2 |
+
+The average-life guess predicts the same number (the mean training RUL) for
+every engine. Beating it by a factor of three on RMSE shows the LSTM is reading
+the sensors, not the base rate. Published LSTM results on FD001 typically fall
+between 13 and 16 RMSE.
+
+The **NASA score** is the official PHM 2008 challenge metric (Saxena et al.,
+eq. 1). It penalises late predictions exponentially harder than early ones,
+because predicting failure too late means an engine failing in service. Lower
+is better.
+
+True RUL is capped at 125 for scoring, the same cap used in training and the
+convention in most published FD001 work. The model therefore cannot tell 125
+cycles left from 200: early in a run it predicts just under 125, then tracks
+the true value once degradation shows in the sensors. The dashboard's
+remaining-life chart shows exactly this.
+
+Training is seeded, but TensorFlow on CPU is not guaranteed bit-for-bit
+deterministic, so a retrain can land slightly off these exact numbers.
 
 ---
 
@@ -312,6 +354,9 @@ The earlier Streamlit view is still in `dashboard/app.py` for comparison.
 - EDA with six figures and a written summary
 - 14-check verification suite
 - Random Forest and XGBoost classifiers with live training output
+- LSTM remaining-life model (TensorFlow/Keras), scored with RMSE, MAE and the
+  NASA PHM 2008 metric, shown live in the dashboard
+- Atomic model saves, so a dashboard refresh never reads a half-written file
 - Inference layer shared by the dashboard, the API and the CLI tools
 - SHAP explanations, per prediction and fleet-wide
 - Per-sensor health scoring, calibrated on training engines
@@ -320,8 +365,6 @@ The earlier Streamlit view is still in `dashboard/app.py` for comparison.
 
 **Not built yet**
 
-- `src/train_lstm.py` — RUL regression. The windowing that feeds it is already
-  built and tested: 14,459 training sequences of shape (30, 17)
 - `src/alerts.py` — email alerts via `smtplib`
 - FD002 / FD004 extension with per-regime normalization
 
@@ -332,11 +375,16 @@ Stated openly rather than discovered during a demo:
 - Random Forest probabilities are bimodal (34 of 100 engines sit at exactly
   0.000 or 1.000), so the alert slider feels coarse on RF and smooth on
   XGBoost
-- Training writes a 53 MB model file non-atomically, so a dashboard refresh
-  landing mid-write could read a truncated file
 - The older Streamlit view still has a fixed 0.05 to 0.95 slider and shows
   clipped true RUL. The web dashboard fixes both: its slider is bounded to the
   selected model's real output range, and it shows unclipped remaining life
+- 54 of the 100 LSTM test predictions are late (they overestimate remaining
+  life), which is the costlier direction. Its NASA score is still low because
+  the late errors are small, but a deployment would want a safety margin or an
+  asymmetric loss that pushes predictions earlier
+- The LSTM gives one number with no stated uncertainty. A prediction range
+  (for example conformal intervals calibrated on the validation engines) is
+  the natural next step
 - Sensor colours measure drift towards failure, not a fault diagnosis. A red
   sensor means "reads like an engine near the end of its life", which is what
   the data supports, not "this component has broken"
@@ -352,6 +400,8 @@ src/
   preprocessing.py     scaling, SMOTE, windowing
   eda.py               figures and written summary
   train_classifier.py  RF + XGBoost with live training output
+  train_lstm.py        remaining-life LSTM with live training output
+  artifact_io.py       atomic model saves, so the dashboard never reads half a file
   inference.py         artifact loading and scoring, shared by UI and future API
   explainability.py    SHAP attribution, per prediction and fleet-wide
   sensor_health.py     per-sensor drift, severity bands, sensor metadata
