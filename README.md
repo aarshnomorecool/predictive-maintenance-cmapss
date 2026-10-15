@@ -469,7 +469,7 @@ The earlier Streamlit view is still in `dashboard/app.py` for comparison.
 
 Stated openly rather than discovered during a demo:
 
-- Random Forest probabilities are bimodal (34 of 100 engines sit at exactly
+- Random Forest probabilities are bimodal (35 of 100 engines sit at exactly
   0.000 or 1.000), so the alert slider feels coarse on RF and smooth on
   XGBoost
 - The older Streamlit view still has a fixed 0.05 to 0.95 slider and shows

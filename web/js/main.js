@@ -524,7 +524,7 @@ function renderSensorDetail() {
 
     <h3>Effect on the failure score</h3>
     <p id="sensor-shap" class="muted">Calculating</p>
-    ${meta.informative ? "" : `<p class="muted">Healthy-to-failure change is only ${meta.signal_to_noise}Ã— this sensor's
+    ${meta.informative ? "" : `<p class="muted">Healthy-to-failure change is only ${meta.signal_to_noise}× this sensor's
       normal noise, so its colour stays grey rather than presenting noise as a finding.</p>`}`;
   $("back").addEventListener("click", () => selectSensor(null));
 
