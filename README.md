@@ -109,6 +109,8 @@ Requires **Python 3.10 or newer**. Tested on 3.13.
 | `python -m src.train_lstm` | **Train the remaining-life LSTM**, live progress, saves to `models/` |
 | `python -m src.explainability` | SHAP attribution: which sensors drove a prediction |
 | `python -m src.latent_space` | Checks the LSTM's vector space is meaningful: neighbour-based life estimate vs LSTM vs a constant guess |
+| `python -m src.simulator` | Checks the trained models read simulated engines the way they read real ones |
+| `python -m src.alerts --test` | Shows the email settings and sends one test email |
 | `python -m src.sensor_health` | Per-sensor health calibration, and a check that the colour bands separate failing engines |
 | `python -m api.server` | **Launch the dashboard** at http://127.0.0.1:8050 |
 | `streamlit run dashboard/app.py` | The earlier, simpler Streamlit view |
@@ -357,6 +359,70 @@ cycles, against 13.58 for the LSTM and 40.69 for guessing the average
 uses an approximate index because it holds millions of vectors; at 20,631 an
 exact search answers in milliseconds.
 
+**Live simulation.** The first row of the fleet list, **Live**, is a virtual
+engine that generates a new cycle every second (adjustable 1× to 10×). All
+three models score it as it runs: failure risk, predicted life left, sensor
+colours, SHAP drivers, the vector space and the network view all update
+live. Controls under the engine:
+
+- **Play / pause**, **speed**, and **wear rate** (normal, fast, severe)
+- **Inject HPC fault** — makes degradation progress three times faster.
+  FD001 has one fault mode, HPC degradation, so this speeds up the fault the
+  models were trained on rather than inventing one they never saw
+- **New engine** — fits a fresh engine with its own random initial wear and
+  manufacturing offsets
+- **Run demo** — a fixed, repeatable scenario for presentations: healthy
+  running, then an HPC fault at cycle 75, the alert at about cycle 89, and
+  end of life at cycle 103. About a minute at 2×
+- **Set a sensor by hand** — click any sensor on the 3D engine, then pick a
+  value. The engine reads it (plus normal noise) every cycle until released.
+  The slider shows the range training engines actually recorded, and warns
+  when a value falls outside it, because the models' response there is not
+  reliable
+
+The simulator is built from statistics measured on the real training
+engines, not invented numbers: every channel's healthy level, failure
+level, noise within one engine, and spread between engines. One hidden
+damage value drives all sensors together, growing exponentially as C-MAPSS
+degradation does. Because the wear rate is known, the simulator also knows
+the true remaining life, shown as "projected life left".
+
+It is checked against the models (`python -m src.simulator`): under normal
+wear the LSTM predicts simulated engines with RMSE 14.9 cycles, close to its
+13.58 on real test engines, and both classifiers separate failing from
+healthy cycles with ROC-AUC 0.94. Under fast wear or an injected fault the
+LSTM is less accurate (RMSE 22 to 29) and alerts come later, because every
+real FD001 engine degrades at a natural pace and the model learned that
+timescale. That is a property of the trained model, shown honestly, not
+hidden.
+
+**Email alerts.** Alerts are raised for the live engine and sent by email.
+The rule, chosen by measuring candidates on the 20 real validation engines
+(which ran to failure and were never used to fit the classifiers):
+
+> Alert when the 5-cycle average failure risk reaches the alert level, or the
+> LSTM predicts 30 cycles or fewer.
+
+| Rule | Shortest warning, real engines | Early false alarms | Shortest warning, HPC fault |
+|---|---|---|---|
+| Single cycle over 50% | 22 cycles | 1 | 7 cycles |
+| **5-cycle average, or LSTM ≤ 30** | **27 cycles** | **0** | **15 cycles** |
+
+Averaging stops one noisy reading from raising an alarm; the LSTM clause
+catches fast faults the classifier reacts to late. Each engine alerts once,
+then only again after it has clearly recovered, so a failing engine does not
+send an email every cycle. The email gives the risk, predicted life, the
+three sensors pushing the risk up most (SHAP) and a link to the engine on the
+dashboard. The **Alerts** button in the top bar shows every alert, whether
+its email was sent, and the exact text.
+
+To turn on email, copy `.env.example` to `.env` and fill it in (Gmail needs
+an [app password](https://myaccount.google.com/apppasswords), not your normal
+password; `.env` is gitignored). No restart needed. Without it, alerts are
+still raised and shown, marked "email not set up". College and venue
+networks often block outgoing mail on port 587; if sending fails, the
+dashboard says so, and a phone hotspot usually works.
+
 **Replay.** The play control and cycle slider step through the engine's
 recorded cycles. Sensor colours, risk, remaining life and SHAP drivers all
 follow the selected cycle, so you can watch an engine degrade.
@@ -391,9 +457,12 @@ The earlier Streamlit view is still in `dashboard/app.py` for comparison.
 - Flask API and web dashboard with the interactive 3D engine
 - Streamlit dashboard (earlier, simpler view)
 
+- Live engine simulator built from measured training statistics, with
+  manual sensor overrides and a scripted demo
+- Email alerts with a measured alert rule, cooldown, and an in-dashboard log
+
 **Not built yet**
 
-- `src/alerts.py` — email alerts via `smtplib`
 - FD002 / FD004 extension with per-regime normalization
 
 ### Known limitations
@@ -434,6 +503,8 @@ src/
   explainability.py    SHAP attribution, per prediction and fleet-wide
   sensor_health.py     per-sensor drift, severity bands, sensor metadata
   latent_space.py      LSTM vectors, nearest-neighbour index, PCA, activations
+  simulator.py         live virtual engine built from training statistics
+  alerts.py            alert rule, email sending, alert log
 api/
   server.py            Flask JSON API, serves the web dashboard
 web/
@@ -452,6 +523,7 @@ reports/
   figures/
 dataset-abstract/      C-MAPSS text files
 non-huma-PDF-format/   Saxena et al. PHM 2008 paper
+.env.example           email alert settings template; copy to .env
 verify_foundation.py   14 correctness checks
 setup.ps1 / setup.sh   one-shot environment setup
 ```

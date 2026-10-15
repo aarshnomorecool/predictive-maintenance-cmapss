@@ -50,6 +50,8 @@ from src.latent_space import (
     layer_model,
 )
 from src.preprocessing import apply_scaler, make_windows_every_cycle
+from src.alerts import AlertManager, EmailSettings
+from src.simulator import SimulationRunner, measure_profile
 from src.sensor_health import (
     CRITICAL_LEVEL,
     SENSOR_SPECS,
@@ -62,6 +64,9 @@ from src.sensor_health import (
 )
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
+
+SIM_ID = "sim"
+SIM_LABEL = "Simulated engine"
 
 app = Flask(__name__, static_folder=None)
 
@@ -96,6 +101,32 @@ def combined_signature() -> tuple:
 _state: State | None = None
 _lock = threading.Lock()
 
+alerts = AlertManager()
+
+
+def _sim_cycle(runner: SimulationRunner, scores: dict) -> None:
+    """Called by the simulation thread after every new cycle."""
+    probability = scores[PROBABILITY_COLUMNS[alerts.model]]
+
+    def drivers() -> list[dict]:
+        # Top sensors pushing the risk up at this cycle, by SHAP
+        history = pd.DataFrame(runner.engine.rows)
+        explanation = explain(runner.scorer.artifacts, history.tail(1), alerts.model)
+        frame = explanation.contributions()
+        frame = frame[frame["shap_value"] > 0]
+        return [{"column": r.feature,
+                 "symbol": SPEC_BY_COLUMN[r.feature].symbol if r.feature in SPEC_BY_COLUMN else r.feature,
+                 "description": SPEC_BY_COLUMN[r.feature].description if r.feature in SPEC_BY_COLUMN else r.feature,
+                 "reading": round(float(r.reading), 3)}
+                for r in frame.head(3).itertuples()]
+
+    alerts.evaluate(SIM_ID, SIM_LABEL, runner.engine.cycle, probability,
+                    scores.get("predicted_rul"), drivers,
+                    EmailSettings.from_env().dashboard_url.rstrip("/") + f"/#engine={SIM_ID}")
+
+
+runner = SimulationRunner(on_cycle=_sim_cycle)
+
 
 def state() -> State:
     """Current state, rebuilt only when the files in models/ change."""
@@ -121,6 +152,9 @@ def state() -> State:
                 lo, hi = space.coords.min(axis=0), space.coords.max(axis=0)
                 center, scale = (lo + hi) / 2, np.maximum((hi - lo) / 2, 1e-9)
                 layers = layer_model(rul_artifacts.model)
+            runner.bind(artifacts, rul_artifacts,
+                        measure_profile(artifacts.feature_cols, artifacts.subset))
+            alerts.reset_engine(SIM_ID)
             _state = State(
                 signature=signature,
                 artifacts=artifacts,
@@ -257,21 +291,62 @@ def api_fleet():
     return jsonify(model=model, token=signature_token(s.signature), engines=engines)
 
 
-@app.get("/api/engine/<int:engine>")
-def api_engine(engine: int):
-    s = state()
-    model = model_param()
+@dataclass
+class EngineData:
+    """One engine's recorded or simulated run, in the shape every view uses."""
+
+    key: object                    # int test unit, or SIM_ID
+    history: pd.DataFrame          # raw readings plus prob_rf / prob_xgb
+    drift: pd.DataFrame
+    predicted: list | None         # LSTM prediction per cycle
+    truth: list[int]               # true (test) or projected (sim) life left
+    in_window: list[bool]
+    truth_label: str
+    sim: dict | None = None        # simulator status and events, for SIM_ID
+
+
+def engine_data(s: State, engine_id: str) -> EngineData:
+    if engine_id == SIM_ID:
+        history, events, status = runner.snapshot()
+        drift = score_history(history, s.calibrations).sort_values(config.CYCLE_COL)
+        truth = [int(round(v)) for v in history["projected_life"]]
+        predicted = (None if history["predicted_rul"].isna().all()
+                     else round_list(history["predicted_rul"], 1))
+        return EngineData(
+            key=SIM_ID, history=history, drift=drift, predicted=predicted, truth=truth,
+            in_window=[t <= s.artifacts.failure_threshold for t in truth],
+            truth_label="Projected life left",
+            sim={**status, "events": events[-12:], "alert_state": alerts.status.get(SIM_ID, "normal"),
+                 "last_alert_id": alerts.last_id()},
+        )
     try:
+        engine = int(engine_id)
         history = engine_history(s.scored, engine)
     except ValueError:
-        abort(404, description=f"Engine {engine} is not in the test split")
+        abort(404, description=f"Engine {engine_id} is not in the test split")
     drift = s.drift[s.drift[config.UNIT_COL] == engine].sort_values(config.CYCLE_COL)
-
     cycles = history[config.CYCLE_COL]
-    last_cycle = int(cycles.iloc[-1])
+    predicted = None
+    if s.predicted_rul is not None:
+        own = s.predicted_rul[s.predicted_rul[config.UNIT_COL] == engine]
+        predicted = round_list(own.set_index(config.CYCLE_COL)["predicted_rul"].reindex(cycles), 1)
+    return EngineData(
+        key=engine, history=history, drift=drift, predicted=predicted,
+        truth=[int(v) for v in unclipped_rul(s, engine, cycles, int(cycles.iloc[-1]))],
+        in_window=[bool(v) for v in history[config.LABEL_COL]],
+        truth_label="True life left",
+    )
+
+
+@app.get("/api/engine/<engine_id>")
+def api_engine(engine_id: str):
+    s = state()
+    model = model_param()
+    d = engine_data(s, engine_id)
+    history = d.history
     sensors = {}
     for column, cal in s.calibrations.items():
-        drift_values = drift[column].to_numpy()
+        drift_values = d.drift[column].to_numpy()
         sensors[column] = {
             "readings": round_list(history[column], 4),
             "drift": round_list(drift_values, 4),
@@ -279,49 +354,41 @@ def api_engine(engine: int):
             "failure_level": round(cal.failure_mean, 4),
             "severity": severity(float(drift_values[-1]), cal.informative),
         }
-    predicted = None
-    if s.predicted_rul is not None:
-        own = s.predicted_rul[s.predicted_rul[config.UNIT_COL] == engine]
-        predicted = round_list(
-            own.set_index(config.CYCLE_COL)["predicted_rul"].reindex(cycles), 1)
     flat = {
         column: round(float(history[column].iloc[-1]), 4)
         for column in config.SENSOR_COLS if column not in s.calibrations
     }
     return jsonify(
-        engine=engine,
+        engine=d.key,
         model=model,
-        cycles=[int(c) for c in cycles],
+        cycles=[int(c) for c in history[config.CYCLE_COL]],
         probability=round_list(history[PROBABILITY_COLUMNS[model]], 4),
-        true_rul=[int(v) for v in unclipped_rul(s, engine, cycles, last_cycle)],
-        predicted_rul=predicted,
-        in_failure_window=[bool(v) for v in history[config.LABEL_COL]],
+        true_rul=d.truth,
+        truth_label=d.truth_label,
+        predicted_rul=d.predicted,
+        in_failure_window=d.in_window,
         sensors=sensors,
         flat_sensors=flat,
-        settings={c: round(float(history[c].iloc[-1]), 4)
-                  for c in config.SETTING_COLS},
+        settings={c: round(float(history[c].iloc[-1]), 4) for c in config.SETTING_COLS},
+        sim=d.sim,
     )
 
 
-@app.get("/api/engine/<int:engine>/explain")
-def api_explain(engine: int):
+@app.get("/api/engine/<engine_id>/explain")
+def api_explain(engine_id: str):
     """SHAP drivers at one cycle. Defaults to the engine's latest cycle."""
     s = state()
     model = model_param()
-    try:
-        history = engine_history(s.scored, engine)
-    except ValueError:
-        abort(404, description=f"Engine {engine} is not in the test split")
-
+    history = engine_data(s, engine_id).history
     cycle = request.args.get("cycle", type=int)
     row = history.tail(1) if cycle is None else history[history[config.CYCLE_COL] == cycle]
     if row.empty:
-        abort(404, description=f"Engine {engine} has no cycle {cycle}")
+        abort(404, description=f"Engine {engine_id} has no cycle {cycle}")
 
     explanation = explain(s.artifacts, row, model)
     frame = explanation.contributions()
     return jsonify(
-        engine=engine,
+        engine=engine_data_key(engine_id),
         model=model,
         cycle=int(row[config.CYCLE_COL].iloc[0]),
         units=explanation.units,
@@ -334,6 +401,10 @@ def api_explain(engine: int):
             for r in frame.itertuples()
         ],
     )
+
+
+def engine_data_key(engine_id: str):
+    return SIM_ID if engine_id == SIM_ID else int(engine_id)
 
 
 # ------------------------------------------------- vector space / network --
@@ -375,21 +446,28 @@ def api_space():
     )
 
 
-@app.get("/api/engine/<int:engine>/space")
-def api_engine_space(engine: int):
-    """One test engine's path through the space, and its nearest training
+@app.get("/api/engine/<engine_id>/space")
+def api_engine_space(engine_id: str):
+    """One engine's path through the space, and its nearest training
     neighbours at every cycle, so replay needs no further requests."""
     s = state()
     require_lstm(s)
-    mask = (s.test_index[config.UNIT_COL] == engine).to_numpy()
-    if not mask.any():
-        abort(404, description=f"Engine {engine} is not in the test split")
-    vectors = s.test_vectors[mask]
+    if engine_id == SIM_ID:
+        history = engine_data(s, SIM_ID).history
+        vectors, index = encode_frame(s.rul, history)
+        cycles = index[config.CYCLE_COL]
+    else:
+        engine = engine_data_key(engine_id)
+        mask = (s.test_index[config.UNIT_COL] == engine).to_numpy()
+        if not mask.any():
+            abort(404, description=f"Engine {engine} is not in the test split")
+        vectors = s.test_vectors[mask]
+        cycles = s.test_index.loc[mask, config.CYCLE_COL]
     xyz = display_coords(s, s.space.project(vectors))
     indices, distances = s.space.neighbors(vectors)
     return jsonify(
-        engine=engine,
-        cycles=[int(c) for c in s.test_index.loc[mask, config.CYCLE_COL]],
+        engine=engine_data_key(engine_id),
+        cycles=[int(c) for c in cycles],
         xyz=round_list(xyz.reshape(-1), 3),
         neighbors=indices.tolist(),
         distances=[round_list(row, 3) for row in distances],
@@ -420,15 +498,13 @@ def api_network():
     )
 
 
-@app.get("/api/engine/<int:engine>/network")
-def api_engine_network(engine: int):
+@app.get("/api/engine/<engine_id>/network")
+def api_engine_network(engine_id: str):
     """What every layer computed for one engine at one cycle."""
     s = state()
     require_lstm(s)
-    try:
-        history = engine_history(s.scored, engine)
-    except ValueError:
-        abort(404, description=f"Engine {engine} is not in the test split")
+    history = engine_data(s, engine_id).history
+    engine = engine_data_key(engine_id)
     cycle = request.args.get("cycle", type=int, default=int(history[config.CYCLE_COL].iloc[-1]))
     upto = history[history[config.CYCLE_COL] <= cycle]
     if upto.empty:
@@ -456,6 +532,93 @@ def api_engine_network(engine: int):
         layers=values,
         predicted_rul=round(float(np.clip(values[-1]["values"][0] * config.RUL_CLIP, 0, config.RUL_CLIP)), 1),
     )
+
+
+# ------------------------------------------------------------ simulation --
+
+@app.get("/api/sim/status")
+def api_sim_status():
+    """Small, cheap summary for the fleet list's live row."""
+    s = state()
+    model = model_param()
+    with runner.lock:
+        last = runner.scores[-1] if runner.scores else {}
+        e = runner.engine
+        return jsonify(
+            cycle=e.cycle, running=runner.running, failed=e.failed, demo=runner.demo is not None,
+            probability=last.get(PROBABILITY_COLUMNS[model]),
+            predicted_rul=last.get("predicted_rul"),
+            projected_life=round(e.projected_life(), 1),
+            alert_state=alerts.status.get(SIM_ID, "normal"),
+            last_alert_id=alerts.last_id(),
+            version=runner.version,
+        )
+
+
+@app.get("/api/sim/ranges")
+def api_sim_ranges():
+    """Range each channel took in the training data, for manual overrides."""
+    state()
+    p = runner.profile
+    return jsonify({c: {"low": round(p.low[c], 4), "high": round(p.high[c], 4),
+                        "healthy": round(p.healthy[c], 4), "failure": round(p.failure[c], 4)}
+                    for c in p.columns})
+
+
+@app.post("/api/sim/control")
+def api_sim_control():
+    state()
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    try:
+        if action == "start":
+            runner.start()
+        elif action == "pause":
+            runner.pause()
+        elif action == "reset":
+            runner.reset()
+            alerts.reset_engine(SIM_ID)
+        elif action == "demo":
+            runner.run_demo()
+            alerts.reset_engine(SIM_ID)
+        elif action == "speed":
+            runner.set_speed(int(body["value"]))
+        elif action == "wear":
+            runner.set_wear(str(body["value"]))
+        elif action == "fault":
+            runner.set_fault(bool(body["value"]))
+        elif action == "override":
+            value = body.get("value")
+            runner.set_override(str(body["column"]), None if value is None else float(value))
+        else:
+            abort(400, description=f"Unknown action {action!r}")
+    except (KeyError, TypeError, ValueError) as exc:
+        abort(400, description=str(exc))
+    return jsonify(ok=True, version=runner.version)
+
+
+# ---------------------------------------------------------------- alerts --
+
+@app.get("/api/alerts")
+def api_alerts():
+    return jsonify(entries=alerts.entries(), email=EmailSettings.from_env().public(),
+                   rule=alerts.rule(), last_id=alerts.last_id())
+
+
+@app.post("/api/alerts/test")
+def api_alerts_test():
+    entry = alerts.send_test(EmailSettings.from_env().dashboard_url)
+    return jsonify(entry)
+
+
+@app.post("/api/alerts/rule")
+def api_alerts_rule():
+    body = request.get_json(silent=True) or {}
+    model = body.get("model")
+    if model is not None and model not in PROBABILITY_COLUMNS:
+        abort(400, description=f"model must be one of {list(PROBABILITY_COLUMNS)}")
+    alerts.set_rule(threshold=body.get("threshold"), model=model)
+    return jsonify(alerts.rule())
 
 
 @app.errorhandler(400)

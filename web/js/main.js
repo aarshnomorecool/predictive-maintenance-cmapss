@@ -1,4 +1,4 @@
-﻿import { EngineView, SEVERITY_COLORS, MODULE_ORDER } from "./engine3d.js";
+import { EngineView, SEVERITY_COLORS, MODULE_ORDER } from "./engine3d.js";
 import { lineChart, divergingBars, formatValue } from "./charts.js";
 import { SpaceView, AXIS_LABEL_POSITIONS, lifeColor } from "./vectorspace.js";
 import { NetworkView } from "./network.js";
@@ -33,6 +33,11 @@ const state = {
   engineSpace: null,       // /api/engine/:id/space for the selected engine
   network: null,           // /api/network structure
   activations: null,       // /api/engine/:id/network at the current cycle
+  simStatus: null,         // /api/sim/status, polled every second
+  simRanges: null,         // training range of each channel, for overrides
+  alerts: null,            // /api/alerts
+  alertsSeen: 0,           // newest alert id already announced
+  alertsAcked: 0,          // newest alert id the user has looked at
 };
 
 // ---------------------------------------------------------------- api ----
@@ -95,6 +100,13 @@ function driftBar(drift) {
 }
 
 const probabilityAt = (i) => state.engine.probability[i];
+const SIM = "sim";
+const isSim = () => state.selectedEngine === SIM;
+const engineName = (e = state.engine) => (e?.engine === SIM ? "Simulated engine" : `Engine ${e?.engine}`);
+const truthLabel = () => state.engine?.truth_label ?? "True life left";
+// The simulated engine uses the server's alert rule (5-cycle average or LSTM),
+// so the pill on screen always agrees with the email that was or was not sent.
+const alertAt = (i) => (isSim() ? state.engine.sim?.alert_state === "alert" : isAlert(probabilityAt(i)));
 const hasRul = () => Array.isArray(state.engine?.predicted_rul);
 // The LSTM is trained on RUL capped at 125, so its top value means
 // "125 or more", not exactly 125.
@@ -281,6 +293,14 @@ function renderFleet() {
 
   const list = $("fleet-list");
   list.replaceChildren();
+  const simRow = document.createElement("li");
+  simRow.id = "sim-row";
+  simRow.role = "option";
+  simRow.tabIndex = isSim() ? 0 : -1;
+  simRow.dataset.engine = SIM;
+  simRow.addEventListener("click", () => selectEngine(SIM));
+  list.appendChild(simRow);
+  renderSimRow();
   for (const e of rows) {
     const li = document.createElement("li");
     li.className = "fleet-row" + (isAlert(e.probability) ? " is-alert" : "");
@@ -308,7 +328,8 @@ $("fleet-list").addEventListener("keydown", (event) => {
   const rows = [...$("fleet-list").children];
   const current = rows.indexOf(document.activeElement);
   if (event.key === "Enter" && current >= 0) {
-    selectEngine(Number(rows[current].dataset.engine));
+    const id = rows[current].dataset.engine;
+    selectEngine(id === SIM ? SIM : Number(id));
     return;
   }
   event.preventDefault();
@@ -353,17 +374,17 @@ function renderViewerHead() {
   const e = state.engine;
   const i = state.cycleIndex;
   const p = probabilityAt(i);
-  const alert = isAlert(p);
+  const alert = alertAt(i);
   const severities = Object.values(severitiesAt(i));
   const red = severities.filter((s) => s === "critical").length;
   const amber = severities.filter((s) => s === "warning").length;
-  $("engine-title").textContent = `Engine ${e.engine}`;
+  $("engine-title").textContent = `${engineName(e)}`;
   $("engine-sub").textContent =
-    `${red} sensors near failure level, ${amber} drifting. Scored by ${MODEL_LABELS[state.model]}.`;
+    `${red} sensor${red === 1 ? "" : "s"} near failure level, ${amber} drifting. Scored by ${MODEL_LABELS[state.model]}.`;
   $("gauge").innerHTML = `
     <div class="${alert ? "status-alert" : "status-ok"}"><dt>Failure risk</dt><dd>${(p * 100).toFixed(1)}%</dd></div>
     ${hasRul() ? `<div><dt>Predicted life left</dt><dd>${lifeText(e.predicted_rul[i])} cycles</dd></div>` : ""}
-    <div><dt>True life left</dt><dd>${e.true_rul[i]} cycles</dd></div>
+    <div><dt>${truthLabel()}</dt><dd>${e.true_rul[i]} cycles</dd></div>
     <div class="${alert ? "status-alert" : "status-ok"}"><dt>Status</dt><dd>${alert ? "Inspect" : "Normal"}</dd></div>`;
   $("cycle-readout").textContent = `Cycle ${e.cycles[i]} of ${e.cycles[e.cycles.length - 1]}`;
   $("cycle").value = i;
@@ -381,15 +402,15 @@ function renderEngineDetail() {
   const e = state.engine;
   const i = state.cycleIndex;
   const p = probabilityAt(i);
-  const alert = isAlert(p);
+  const alert = alertAt(i);
   const detail = $("detail");
   detail.innerHTML = `
-    <h2>Engine ${e.engine}<span class="state-pill" style="background:${alert ? "var(--crit)" : "var(--ok)"}">
+    <h2>${engineName(e)}<span class="state-pill" style="background:${alert ? "var(--crit)" : "var(--ok)"}">
       ${alert ? "Inspect" : "Normal"}</span></h2>
-    <p class="muted">Recorded test trajectory, cycle ${e.cycles[i]}.</p>
+    <p class="muted">${isSim() ? "Live simulated engine" : "Recorded test trajectory"}, cycle ${e.cycles[i]}.</p>
     <dl class="facts">
       <div><dt>Failure risk</dt><dd>${(p * 100).toFixed(1)}%</dd></div>
-      <div><dt>True life left</dt><dd>${e.true_rul[i]}</dd></div>
+      <div><dt>${truthLabel()}</dt><dd>${e.true_rul[i]}</dd></div>
       ${hasRul()
         ? `<div><dt>Predicted life left</dt><dd>${lifeText(e.predicted_rul[i])}</dd></div>`
         : `<div><dt>Alert level</dt><dd>${(state.threshold * 100).toFixed(0)}%</dd></div>`}
@@ -421,7 +442,7 @@ function renderEngineDetail() {
     lineChart($("rul-chart"), {
       x: e.cycles, y: e.predicted_rul, color: "var(--cobalt)", marker: i,
       yDomain: [0, Math.max(state.meta.rul_ceiling + 10, ...e.true_rul.slice(0, 1))],
-      extra: [{ y: e.true_rul, color: "var(--ink)", dash: "5 4", label: "true" }],
+      extra: [{ y: e.true_rul, color: "var(--ink)", dash: "5 4", label: isSim() ? "projected" : "true" }],
       refs: [
         { y: state.meta.rul_ceiling, label: "Model ceiling", color: "var(--graphite)", dash: "2 3" },
         { y: state.meta.failure_threshold, label: "Failure window", color: "var(--crit)" },
@@ -467,7 +488,7 @@ function renderSensorDetail() {
   const i = state.cycleIndex;
   const severity = severityAt(column, i);
   const detail = $("detail");
-  const back = `<button class="back" id="back" type="button">Engine ${e.engine} overview</button>`;
+  const back = `<button class="back" id="back" type="button">${engineName(e)} overview</button>`;
 
   if (!meta.monitored) {
     detail.innerHTML = `${back}
@@ -590,6 +611,14 @@ function renderShap() {
 }
 
 function renderDetail() {
+  // The simulation refreshes every second; never wipe an input mid-edit
+  const active = document.activeElement;
+  if (isSim() && $("detail").contains(active) && active.matches("input")) return;
+  if (state.viewMode === "engine" && state.selectedSensor) {
+    renderSensorDetail();
+    if (isSim()) renderOverride(state.selectedSensor);
+    return;
+  }
   if (state.viewMode === "space") renderSpaceDetail();
   else if (state.viewMode === "network") renderNetworkDetail();
   else if (state.selectedSensor) renderSensorDetail();
@@ -650,12 +679,12 @@ function renderSpaceDetail() {
   const kept = sp.explained_variance.reduce((a, b) => a + b, 0);
   detail.innerHTML = `
     <h2>Engines like this one</h2>
-    <p class="muted">Engine ${e.engine} at cycle ${e.cycles[i]}, compared with every cycle of the
+    <p class="muted">${engineName(e)} at cycle ${e.cycles[i]}, compared with every cycle of the
       ${sp.engines} training engines, which all ran to failure.</p>
     <dl class="facts">
       <div><dt>Neighbours' average</dt><dd>${lifeText(es.knn_life[i])}</dd></div>
       <div><dt>LSTM predicts</dt><dd>${lifeText(e.predicted_rul[i])}</dd></div>
-      <div><dt>True life left</dt><dd>${e.true_rul[i]}</dd></div>
+      <div><dt>${truthLabel()}</dt><dd>${e.true_rul[i]}</dd></div>
     </dl>
     <h3>${sp.neighbors} nearest neighbours</h3>
     <table class="nb-table">
@@ -724,12 +753,12 @@ function renderNetworkDetail() {
   const [l1, l2, d1] = n.layers;
   detail.innerHTML = `
     <h2>Inside the LSTM</h2>
-    <p class="muted">Engine ${e.engine} at cycle ${cycle}. Every coloured neuron is the number that layer really
+    <p class="muted">${engineName(e)} at cycle ${cycle}. Every coloured neuron is the number that layer really
       computed for this engine; drag the cycle slider or press play to watch it change.</p>
     <dl class="facts">
       <div><dt>Predicted life left</dt><dd>${a ? lifeText(a.predicted_rul) : "–"}</dd></div>
       <div><dt>Trained parameters</dt><dd>${n.parameters.toLocaleString()}</dd></div>
-      <div><dt>True life left</dt><dd>${e.true_rul[state.cycleIndex]}</dd></div>
+      <div><dt>${truthLabel()}</dt><dd>${e.true_rul[state.cycleIndex]}</dd></div>
     </dl>
     <h3>How a prediction flows</h3>
     <ol class="layer-list">
@@ -819,6 +848,9 @@ async function selectEngine(engine) {
   $("cycle").max = state.cycleIndex;
   state.explain = null;
   state.activations = null;
+  $("sim-bar").hidden = !isSim();
+  document.querySelector(".replay").hidden = isSim();
+  if (isSim()) renderSimBar();
   renderFleet();
   renderCycle();
   updateHash();
@@ -846,6 +878,7 @@ async function setModel(model) {
   if (model === state.model) return;
   state.model = model;
   renderModelSwitch();
+  syncAlertRule();
   await loadFleet();
   const sensor = state.selectedSensor;
   await selectEngine(state.selectedEngine);
@@ -900,6 +933,7 @@ $("to-latest").addEventListener("click", () => {
 $("threshold").addEventListener("input", (e) => {
   state.threshold = Number(e.target.value);
   $("threshold-value").textContent = state.threshold.toFixed(2);
+  syncAlertRule();
   renderFleet();
   renderViewerHead();
   renderDetail();
@@ -916,6 +950,256 @@ let resizeTimer;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => state.engine && renderDetail(), 150);
+});
+
+// ------------------------------------------------------------ simulation ----
+
+const SIM_POLL_MS = 1000;
+
+async function apiPost(path, body = {}) {
+  const response = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw Object.assign(new Error(data.error || response.statusText), { status: response.status });
+  return data;
+}
+
+async function simControl(action, extra = {}) {
+  try {
+    await apiPost("/api/sim/control", { action, ...extra });
+    await pollSim({ force: true });
+  } catch (err) {
+    toast(`Simulation: ${err.message}`);
+  }
+}
+
+async function pollSim({ force = false } = {}) {
+  if (!state.meta) return;
+  try {
+    const st = await api(`/api/sim/status?model=${state.model}`);
+    const changed = force || !state.simStatus || st.version !== state.simStatus.version;
+    state.simStatus = st;
+    if (changed) renderSimRow();
+    if (st.last_alert_id > state.alertsSeen || $("alerts-dialog").open) await refreshAlerts({ announce: true });
+    if (changed && isSim()) await refreshSimEngine();
+  } catch {
+    /* the main poll reports a lost server */
+  }
+}
+
+async function refreshSimEngine() {
+  const data = await api(`/api/engine/${SIM}?model=${state.model}`);
+  if (!isSim()) return;
+  state.engine = data;
+  state.cycleIndex = data.cycles.length - 1;     // the simulation is always live
+  $("cycle").max = state.cycleIndex;
+  renderSimBar();
+  if (state.viewMode === "space" && state.space) {
+    state.engineSpace = null;                      // the path grew; fetch it again
+    ensureSpace().then(renderDetail).catch(() => {});
+  }
+  renderCycle();
+}
+
+function renderSimRow() {
+  const row = $("sim-row");
+  const st = state.simStatus;
+  if (!row) return;
+  const alert = st?.alert_state === "alert";
+  row.className = "fleet-row sim-row" + (alert ? " is-alert" : "") + (st?.running ? " is-running" : "");
+  row.setAttribute("aria-selected", String(isSim()));
+  const risk = st?.probability == null ? null : st.probability;
+  const status = !st ? "Loading" : st.failed ? "Reached end of life" : st.running ? `Running, cycle ${st.cycle}`
+    : st.cycle > 1 ? `Paused at cycle ${st.cycle}` : "Ready to start";
+  row.innerHTML = `
+    <span class="fleet-id"><span class="live-dot"></span>Live<small>${st?.predicted_rul == null ? "simulated" : `~${lifeText(st.predicted_rul)} left`}</small></span>
+    <span class="prob">
+      <span class="prob-track"><span class="prob-fill" style="width:${(risk ?? 0) * 100}%;${alert ? "" : "background:var(--cobalt)"}"></span></span>
+      <span class="prob-text">${risk == null ? "" : `${(risk * 100).toFixed(1)}% risk, `}${status}</span>
+    </span>
+    <span class="dots">${alert ? '<b style="color:var(--crit)">Alert</b>' : ""}</span>`;
+}
+
+function renderSimBar() {
+  const sim = state.engine?.sim;
+  if (!sim) return;
+  $("sim-play-icon").setAttribute("d", sim.running ? "M4 2.5h3v11H4zM9 2.5h3v11H9z" : "M4 2.5v11l9-5.5z");
+  $("sim-play").setAttribute("aria-label", sim.running ? "Pause simulation" : sim.failed ? "Start a new engine" : "Start simulation");
+
+  const segment = (box, values, current, label, action) => {
+    box.replaceChildren(...values.map((v) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.role = "radio";
+      b.textContent = label(v);
+      b.setAttribute("aria-checked", String(v === current));
+      b.addEventListener("click", () => simControl(action, { value: v }));
+      return b;
+    }));
+  };
+  segment($("sim-speed"), sim.speeds, sim.speed, (v) => `${v}×`, "speed");
+  segment($("sim-wear"), sim.wear_presets, sim.wear, (v) => v[0].toUpperCase() + v.slice(1), "wear");
+  $("sim-fault").setAttribute("aria-pressed", String(sim.fault));
+  $("sim-fault").textContent = sim.fault ? "HPC fault active" : "Inject HPC fault";
+
+  // Share of the engine's expected life already used, at the current wear
+  // rate. Raw damage grows exponentially, so it would read "47%" with only
+  // 15 cycles to go.
+  const usedPct = sim.failed ? 100 : Math.min(100, (sim.cycle / (sim.cycle + sim.projected_life)) * 100);
+  $("sim-wear-fill").style.width = `${usedPct}%`;
+  $("sim-status").textContent = sim.failed
+    ? `End of life at cycle ${sim.cycle}. Press play to fit a new engine.`
+    : `Cycle ${sim.cycle}, ${usedPct.toFixed(0)}% of life used, about ${Math.round(sim.projected_life)} cycles left at this wear rate`;
+  const last = sim.events[sim.events.length - 1];
+  // Event text names channels by column; show the symbols used everywhere else
+  $("sim-event").textContent = last
+    ? `Cycle ${last.cycle}: ${last.text.replace(/sensor_\d+/g, (c) => symbolOf(c))}` : "";
+}
+
+$("sim-play").addEventListener("click", () => {
+  const sim = state.engine?.sim;
+  simControl(sim?.running ? "pause" : "start");
+});
+$("sim-fault").addEventListener("click", () => simControl("fault", { value: !state.engine?.sim?.fault }));
+$("sim-reset").addEventListener("click", () => simControl("reset"));
+$("sim-demo").addEventListener("click", () => {
+  setView("engine");
+  simControl("demo");
+  toast("Demo started: a healthy engine, then an HPC fault, then the alert. About a minute.");
+});
+
+// Manual override panel, shown under a sensor's detail when the simulation is selected
+function renderOverride(column) {
+  const meta = sensorMeta(column);
+  const detail = $("detail");
+  if (!meta.monitored) {
+    detail.insertAdjacentHTML("beforeend", `<h3>Set this sensor by hand</h3>
+      <p class="muted">The models do not use ${meta.symbol}, so changing it would not affect any prediction.</p>`);
+    return;
+  }
+  const r = state.simRanges?.[column];
+  if (!r) return;
+  const current = state.engine.sim.overrides[column];
+  const latest = state.engine.sensors[column].readings[state.cycleIndex];
+  const value = current ?? latest;
+  const span = r.high - r.low;
+  const lo = r.low - span * 0.5, hi = r.high + span * 0.5;
+  detail.insertAdjacentHTML("beforeend", `
+    <h3>Set this sensor by hand</h3>
+    <p class="muted">${current == null ? "The engine is generating this sensor's readings." :
+      `<span class="is-overridden">Held at ${formatValue(current)} ${meta.units}.</span>`}
+      Pick a value and the simulated engine reads it every cycle, plus normal noise, until you release it.</p>
+    <div class="override">
+      <input type="range" id="ov-range" min="${lo}" max="${hi}" step="${span / 400}" value="${value}"
+        aria-label="${meta.symbol} value">
+      <input type="number" id="ov-num" step="${span / 400}" value="${value.toFixed(3)}" aria-label="${meta.symbol} value">
+    </div>
+    <div class="override-actions">
+      <button class="ghost small" id="ov-apply" type="button">Apply</button>
+      <button class="ghost small" id="ov-clear" type="button" ${current == null ? "disabled" : ""}>Release</button>
+      <button class="ghost small" id="ov-fail" type="button">Set to failure level</button>
+    </div>
+    <p class="muted" style="margin-top:0.4rem">Healthy level ${formatValue(r.healthy)}, failure level ${formatValue(r.failure)}.
+      Training engines recorded between ${formatValue(r.low)} and ${formatValue(r.high)} ${meta.units}.</p>
+    <p class="ov-warn" id="ov-warn" hidden>Outside anything in the training data. The models were never shown a value
+      like this, so their response to it is not reliable.</p>`);
+
+  const range = $("ov-range"), num = $("ov-num"), warn = $("ov-warn");
+  const showWarn = (v) => { warn.hidden = v >= r.low && v <= r.high; };
+  showWarn(value);
+  range.addEventListener("input", () => { num.value = Number(range.value).toFixed(3); showWarn(Number(range.value)); });
+  num.addEventListener("input", () => { range.value = num.value; showWarn(Number(num.value)); });
+  const apply = (v) => {
+    document.activeElement.blur();
+    simControl("override", { column, value: v });
+    toast(`${meta.symbol} held at ${formatValue(v)} ${meta.units}`);
+  };
+  $("ov-apply").addEventListener("click", () => apply(Number(num.value)));
+  num.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(Number(num.value)); });
+  $("ov-fail").addEventListener("click", () => apply(r.failure));
+  $("ov-clear").addEventListener("click", () => {
+    simControl("override", { column, value: null });
+    toast(`${meta.symbol} released back to simulated readings`);
+  });
+}
+
+// ---------------------------------------------------------------- alerts ----
+
+let ruleTimer = null;
+function syncAlertRule() {
+  clearTimeout(ruleTimer);
+  ruleTimer = setTimeout(() => apiPost("/api/alerts/rule", { threshold: state.threshold, model: state.model })
+    .catch(() => {}), 250);
+}
+
+async function refreshAlerts({ announce }) {
+  const data = await api("/api/alerts");
+  const fresh = data.entries.filter((e) => e.id > state.alertsSeen && e.kind !== "test");
+  state.alerts = data;
+  if (announce) {
+    for (const e of fresh.reverse()) {
+      const where = e.status === "not_configured" ? "logged here; email is not set up"
+        : `emailing ${e.recipients.join(", ")}`;
+      toast(e.kind === "alert" ? `Alert: ${e.engine} needs inspection (${where})` : `${e.engine} is back to normal (${where})`);
+    }
+  }
+  state.alertsSeen = Math.max(state.alertsSeen, data.last_id);
+  if (!announce && !state.alertsAcked) state.alertsAcked = data.last_id;
+  const unread = data.entries.filter((e) => e.id > state.alertsAcked && e.kind === "alert").length;
+  $("alert-badge").textContent = unread;
+  $("alert-badge").hidden = unread === 0;
+  if ($("alerts-dialog").open) renderAlerts();
+}
+
+const STATUS_TEXT = {
+  sent: (e) => `<span style="color:var(--ok)">Email sent</span> to ${e.recipients.join(", ")}${e.send_seconds ? ` in ${e.send_seconds}s` : ""}.`,
+  sending: () => `Sending email…`,
+  failed: (e) => `<span style="color:var(--crit)">Email failed.</span> ${e.error}`,
+  not_configured: () => `Logged here only. Email is not set up yet.`,
+};
+
+function renderAlerts() {
+  const data = state.alerts;
+  if (!data) return;
+  const em = data.email;
+  const box = em.configured
+    ? `<div class="email-box"><b>Email alerts are on.</b> Messages go from ${em.sender} to ${em.recipients.join(", ")}
+        through ${em.host}:${em.port}.
+        <div style="margin-top:0.5rem"><button class="ghost small" id="send-test" type="button">Send test email</button></div></div>`
+    : `<div class="email-box is-off"><b>Email is not set up yet.</b> Alerts still appear here and as pop-ups.
+        To get them by email, copy <code>.env.example</code> to <code>.env</code> in the project folder and fill in
+        ${em.missing.map((m) => `<code>${m}</code>`).join(", ")}. No restart is needed.</div>`;
+  const kindColor = { alert: "var(--crit)", recovered: "var(--ok)", test: "var(--cobalt)" };
+  const kindText = { alert: "Alert", recovered: "Recovered", test: "Test" };
+  const items = data.entries.length ? data.entries.map((e) => `
+    <li class="alert-entry">
+      <div class="alert-entry-head">
+        <span class="alert-kind" style="background:${kindColor[e.kind]}">${kindText[e.kind]}</span>
+        <b>${e.engine}</b>${e.cycle ? `<span class="muted">cycle ${e.cycle}</span>` : ""}
+        <span class="alert-time">${new Date(e.time).toLocaleString([], { dateStyle: "medium", timeStyle: "medium" })}</span>
+      </div>
+      ${e.reason ? `<div>${e.reason}</div>` : ""}
+      <div class="alert-status">${(STATUS_TEXT[e.status] || (() => e.status))(e)}</div>
+      <details><summary>Email: ${e.subject}</summary><pre>${e.body.replace(/</g, "&lt;")}</pre></details>
+    </li>`).join("") : `<li class="muted" style="padding:0.6rem 0">No alerts yet. Start the simulated engine, or press Run demo.</li>`;
+  $("alerts-body").innerHTML = `${box}
+    <p class="muted" style="margin:0.8rem 0 0">${data.rule.text} Each engine alerts once, then again only after it
+      has recovered.</p>
+    <ol class="alert-list">${items}</ol>`;
+  $("send-test")?.addEventListener("click", async () => {
+    const entry = await apiPost("/api/alerts/test");
+    toast(entry.status === "not_configured" ? "Email is not set up yet" : "Sending test email…");
+    await refreshAlerts({ announce: false });
+  });
+}
+
+$("open-alerts").addEventListener("click", async () => {
+  await refreshAlerts({ announce: false });
+  state.alertsAcked = state.alerts?.last_id ?? 0;
+  $("alert-badge").hidden = true;
+  renderAlerts();
+  $("alerts-dialog").showModal();
 });
 
 // ------------------------------------------------------------ live sync ----
@@ -942,11 +1226,14 @@ async function loadAll({ keepSelection = false } = {}) {
     showBanner("");
   }
   await loadFleet();
+  state.simRanges = await api("/api/sim/ranges");
+  await refreshAlerts({ announce: false });
+  syncAlertRule();
 
   const hash = new URLSearchParams(location.hash.slice(1));
-  const fromHash = Number(hash.get("engine"));
+  const fromHash = hash.get("engine") === SIM ? SIM : Number(hash.get("engine"));
   const engine = keepSelection && state.selectedEngine ? state.selectedEngine
-    : state.fleet.some((e) => e.engine === fromHash) ? fromHash : state.fleet[0].engine;
+    : fromHash === SIM || state.fleet.some((e) => e.engine === fromHash) ? fromHash : state.fleet[0].engine;
   const hashSensor = state.meta.sensors.some((s) => s.column === hash.get("sensor")) ? hash.get("sensor") : null;
   const sensor = keepSelection ? state.selectedSensor : hashSensor;
   await selectEngine(engine);
@@ -989,4 +1276,5 @@ async function poll() {
       : "Could not reach the model server. Start it with <code>python -m api.server</code> and reload.");
   }
   setInterval(poll, POLL_MS);
+  setInterval(pollSim, SIM_POLL_MS);
 })();

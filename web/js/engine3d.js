@@ -262,7 +262,7 @@ export class EngineView {
 
   // Place one marker per C-MAPSS channel at its module's station.
   setSensors(sensors) {
-    for (const { mesh, halo } of this.markers.values()) this.engine.remove(mesh, halo);
+    for (const { mesh, halo, hit } of this.markers.values()) this.engine.remove(mesh, halo, hit);
     this.markers.clear();
 
     const byModule = {};
@@ -270,6 +270,11 @@ export class EngineView {
 
     const sphere = new THREE.SphereGeometry(0.05, 24, 16);
     const ring = new THREE.RingGeometry(0.07, 0.095, 40);
+    // Click target: fixed size and invisible. Picking against the halo made
+    // the clickable area pulse with it, so a click on a critical sensor could
+    // land after the ring had shrunk and miss.
+    const hitGeometry = new THREE.SphereGeometry(0.085, 12, 8);
+    const hitMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, colorWrite: false });
     for (const [module, list] of Object.entries(byModule)) {
       const station = STATIONS[module];
       const step = THREE.MathUtils.degToRad(15);
@@ -294,8 +299,12 @@ export class EngineView {
         halo.position.copy(position);
         halo.userData.column = sensor.column;
 
-        this.engine.add(mesh, halo);
-        this.markers.set(sensor.column, { mesh, halo, severity: "unmonitored", module });
+        const hit = new THREE.Mesh(hitGeometry, hitMaterial);
+        hit.position.copy(position);
+        hit.userData.column = sensor.column;
+
+        this.engine.add(mesh, halo, hit);
+        this.markers.set(sensor.column, { mesh, halo, hit, severity: "unmonitored", module });
       });
     }
   }
@@ -380,7 +389,7 @@ export class EngineView {
       ((event.clientX - rect.left) / rect.width) * 2 - 1,
       -((event.clientY - rect.top) / rect.height) * 2 + 1);
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    const meshes = [...this.markers.values()].flatMap((m) => [m.mesh, m.halo]);
+    const meshes = [...this.markers.values()].map((m) => m.hit);
     const hit = this.raycaster.intersectObjects(meshes, false)[0];
     return hit ? hit.object.userData.column : null;
   }

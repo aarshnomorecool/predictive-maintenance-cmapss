@@ -31,6 +31,7 @@
         <input type="range" id="threshold" min="0.05" max="0.95" step="0.01" value="0.5" aria-describedby="threshold-hint">
         <output id="threshold-value">0.50</output>
       </label>
+      <button class="ghost" id="open-alerts" type="button">Alerts<span class="badge" id="alert-badge" hidden>0</span></button>
       <button class="ghost" id="open-report" type="button">Model report</button>
       <span class="sync" id="sync" aria-live="polite"><span class="sync-dot"></span><span id="sync-text">Connecting</span></span>
     </div>
@@ -123,6 +124,26 @@
         <span class="cycle-readout" id="cycle-readout"></span>
         <button class="ghost small" id="to-latest" type="button">Latest cycle</button>
       </div>
+
+      <div class="sim-bar" id="sim-bar" hidden>
+        <div class="sim-controls">
+          <button class="play" id="sim-play" type="button" aria-label="Start simulation">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path id="sim-play-icon" d="M4 2.5v11l9-5.5z"/></svg>
+          </button>
+          <div class="sim-group"><span class="sim-label" id="sim-speed-label">Speed</span>
+            <div class="segmented small" id="sim-speed" role="radiogroup" aria-labelledby="sim-speed-label"></div></div>
+          <div class="sim-group"><span class="sim-label" id="sim-wear-label">Wear</span>
+            <div class="segmented small" id="sim-wear" role="radiogroup" aria-labelledby="sim-wear-label"></div></div>
+          <button class="ghost small" id="sim-fault" type="button" aria-pressed="false">Inject HPC fault</button>
+          <button class="ghost small" id="sim-reset" type="button">New engine</button>
+          <button class="sim-demo" id="sim-demo" type="button">Run demo</button>
+        </div>
+        <div class="sim-readout">
+          <div class="sim-wear-meter" aria-hidden="true"><span id="sim-wear-fill"></span></div>
+          <span id="sim-status"></span>
+          <span class="sim-event" id="sim-event"></span>
+        </div>
+      </div>
     </section>
 
     <aside class="detail" id="detail" aria-label="Details" aria-live="polite"></aside>
@@ -134,6 +155,14 @@
       <button class="ghost small" value="close">Close</button>
     </form>
     <div id="report-body"></div>
+  </dialog>
+
+  <dialog id="alerts-dialog">
+    <form method="dialog" class="report-head">
+      <h2>Alerts</h2>
+      <button class="ghost small" value="close">Close</button>
+    </form>
+    <div id="alerts-body"></div>
   </dialog>
 
   <div class="toast" id="toast" role="status" hidden></div>

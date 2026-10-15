@@ -32,6 +32,7 @@
 html, body { height: 100%; }
 body {
   margin: 0;
+  display: flex; flex-direction: column;
   background: var(--paper);
   color: var(--ink);
   font: 400 var(--step-0)/1.45 var(--font);
@@ -87,11 +88,12 @@ button, input, select { font: inherit; color: inherit; }
 .banner code { background: var(--panel); padding: 0.05rem 0.35rem; border-radius: 3px; }
 
 /* -------------------------------------------------------------- layout -- */
+/* Fills whatever height the top bar leaves, however many rows it wraps to */
 .layout {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr) 380px;
-  height: calc(100vh - 62px);
-  min-height: 620px;
+  flex: 1 1 0;
+  min-height: 560px;
 }
 .fleet, .detail { background: var(--panel); overflow: auto; min-width: 0; }
 .fleet { border-right: 1px solid var(--rule); display: flex; flex-direction: column; }
@@ -133,7 +135,9 @@ button, input, select { font: inherit; color: inherit; }
 .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
 
 /* -------------------------------------------------------------- viewer -- */
-.viewer { display: flex; flex-direction: column; min-width: 0; }
+/* min-height 0 lets the 3D stage shrink to make room for the bars below it;
+   without it the column grows past the window and the whole page scrolls. */
+.viewer { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .viewer-head {
   display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem;
   padding: 1rem 1.25rem 0;
@@ -147,7 +151,7 @@ button, input, select { font: inherit; color: inherit; }
 .gauge .status-alert dd { color: var(--crit); }
 .gauge .status-ok dd { color: var(--ok); }
 
-.stage { position: relative; flex: 1; min-height: 300px; }
+.stage { position: relative; flex: 1 1 0; min-height: 200px; }
 .stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
 .callout-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
 .callout-layer path { fill: none; stroke: var(--ink); stroke-width: 1.25; }
@@ -266,6 +270,53 @@ button, input, select { font: inherit; color: inherit; }
 .layer-list li { padding: 0.45rem 0; border-bottom: 1px solid var(--rule-soft); }
 .layer-list b { display: block; }
 
+/* Simulation: the one place the dashboard is live, not a recording */
+.sim-bar { background: var(--panel); border-top: 1px solid var(--rule); padding: 0.55rem 1.25rem 0.6rem; }
+.sim-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 0.9rem; }
+.sim-group { display: inline-flex; align-items: center; gap: 0.4rem; }
+.sim-label { font-size: var(--step--1); color: var(--graphite); }
+.segmented.small button { padding: 0.18rem 0.55rem; font-size: var(--step--1); }
+#sim-fault[aria-pressed="true"] { background: var(--crit); border-color: var(--crit); color: #fff; }
+.sim-demo {
+  margin-left: auto; border: 1px solid var(--cobalt); background: var(--cobalt); color: #fff;
+  border-radius: var(--radius); padding: 0.3rem 0.9rem; cursor: pointer; font-weight: 600;
+}
+.sim-readout { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.9rem; margin-top: 0.5rem;
+  font-size: var(--step--1); color: var(--graphite); }
+.sim-wear-meter { width: 140px; height: 8px; border-radius: 4px; background: var(--rule-soft); overflow: hidden; }
+.sim-wear-meter span { display: block; height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--ok), var(--warn) 60%, var(--crit)); background-size: 140px 100%; }
+#sim-status { color: var(--ink); }
+.sim-event { font-style: italic; }
+
+.fleet-row.sim-row { background: #fff; border-left-color: var(--cobalt); }
+.fleet-row.sim-row.is-alert { border-left-color: var(--crit); }
+.live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--low);
+  margin-right: 0.3rem; vertical-align: 1px; }
+.sim-row.is-running .live-dot { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-wash); }
+
+.badge { display: inline-block; min-width: 1.3em; padding: 0 0.35em; margin-left: 0.4rem; border-radius: 999px;
+  background: var(--crit); color: #fff; font-size: 0.75rem; line-height: 1.35; text-align: center; font-weight: 600; }
+
+.override { display: grid; grid-template-columns: 1fr 6.5rem; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+.override input[type="range"] { accent-color: var(--ink); }
+.override input[type="number"] { border: 1px solid var(--rule); border-radius: var(--radius); padding: 0.25rem 0.4rem; background: #fff; }
+.override-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+.ov-warn { color: var(--crit); font-size: var(--step--1); margin-top: 0.4rem; }
+.is-overridden { color: var(--cobalt); font-weight: 600; }
+
+.email-box { border: 1px solid var(--rule); border-radius: var(--radius); padding: 0.7rem 0.85rem; background: #fff; }
+.email-box.is-off { border-color: var(--warn); background: var(--warn-wash); }
+.email-box code, .alert-entry code { background: var(--paper); padding: 0 0.3rem; border-radius: 3px; }
+.alert-list { list-style: none; margin: 0.9rem 0 0; padding: 0; }
+.alert-entry { border-bottom: 1px solid var(--rule-soft); padding: 0.6rem 0; }
+.alert-entry-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 0.6rem; }
+.alert-kind { font-size: 0.75rem; font-weight: 600; color: #fff; padding: 0.05rem 0.45rem; border-radius: 999px; }
+.alert-time { color: var(--graphite); font-size: var(--step--1); margin-left: auto; }
+.alert-status { font-size: var(--step--1); margin-top: 0.2rem; }
+.alert-entry details { margin-top: 0.3rem; font-size: var(--step--1); }
+.alert-entry pre { white-space: pre-wrap; font: inherit; background: var(--paper); padding: 0.5rem 0.6rem; border-radius: var(--radius); margin: 0.3rem 0 0; }
+
 /* -------------------------------------------------------------- detail -- */
 .detail h2 { font-size: var(--step-2); font-stretch: semi-condensed; line-height: 1.1; }
 .detail h3 { font-size: var(--step-0); margin: 1.4rem 0 0.4rem; }
@@ -331,8 +382,19 @@ dialog::backdrop { background: rgba(27, 38, 49, 0.35); }
 @media (max-width: 1280px) {
   .layout { grid-template-columns: 240px minmax(0, 1fr) 340px; }
 }
+/* Laptop screens: keep the header numbers on one line and give the
+   space back to the 3D view */
+@media (max-width: 1440px) {
+  .gauge { gap: 1rem; }
+  .gauge dd { font-size: var(--step-1); white-space: nowrap; }
+  .viewer-head h2 { font-size: var(--step-2); }
+}
+@media (max-height: 820px) {
+  .stage-note { display: none; }
+  .legend { bottom: 0.6rem; }
+}
 @media (max-width: 1024px) {
-  .layout { grid-template-columns: minmax(0, 1fr); height: auto; }
+  .layout { grid-template-columns: minmax(0, 1fr); flex: none; height: auto; }
   .fleet { border-right: 0; border-bottom: 1px solid var(--rule); max-height: 340px; }
   .stage { min-height: 420px; }
   .detail { border-left: 0; border-top: 1px solid var(--rule); }
