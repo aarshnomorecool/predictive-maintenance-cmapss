@@ -405,7 +405,7 @@ The rule, chosen by measuring candidates on the 20 real validation engines
 
 | Rule | Shortest warning, real engines | Early false alarms | Shortest warning, HPC fault |
 |---|---|---|---|
-| Single cycle over 50% | 22 cycles | 1 | 7 cycles |
+| Single cycle over 50% | 22 cycles | 1 | 14 cycles (but 1 early false alarm) |
 | **5-cycle average, or LSTM ≤ 30** | **27 cycles** | **0** | **15 cycles** |
 
 Averaging stops one noisy reading from raising an alarm; the LSTM clause
