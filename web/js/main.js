@@ -13,7 +13,11 @@ const SEVERITY_TEXT = {
   critical: "Near failure level",
   low_signal: "Too little signal",
   unmonitored: "Not used by models",
+  suspect: "Suspected sensor fault",
 };
+// The sensor the "Break a sensor" demo button sticks at its failure level:
+// Ps30, the reading the models lean on most.
+const DEMO_BREAK_SENSOR = "sensor_11";
 const MODEL_LABELS = { RandomForest: "Random Forest", XGBoost: "XGBoost" };
 
 const state = {
@@ -38,6 +42,9 @@ const state = {
   alerts: null,            // /api/alerts
   alertsSeen: 0,           // newest alert id already announced
   alertsAcked: 0,          // newest alert id the user has looked at
+  insights: {},            // results of the offline analyses, by name (null if not run)
+  fleetPlan: null,         // live inspect-next list and workshop plan from /api/fleet
+  bobChat: { currentUnit: null, history: [], sending: false },
 };
 
 // ---------------------------------------------------------------- api ----
@@ -67,9 +74,17 @@ function toast(text) {
 const sensorMeta = (column) => state.meta.sensors.find((s) => s.column === column);
 const symbolOf = (column) => sensorMeta(column)?.symbol ?? column;
 
+// Sensor integrity guard: which sensors look broken at this cycle
+const integrityFlag = (column, i) => Boolean(state.engine?.integrity?.flags?.[column]?.[i]);
+const faultyAt = (i) => (state.engine?.integrity?.sensors ?? []).filter((c) => integrityFlag(c, i));
+const excludedByTechnician = () => state.engine?.integrity?.excluded_by_technician ?? [];
+// Many sensors disagreeing together: a wear pattern the models never learned
+const unfamiliarAt = (i) => Boolean(state.engine?.integrity?.unfamiliar?.[i]);
+
 function severityAt(column, index) {
   const meta = sensorMeta(column);
   if (!meta?.monitored) return "unmonitored";
+  if (integrityFlag(column, index)) return "suspect";
   if (!meta.informative) return "low_signal";
   const drift = state.engine.sensors[column].drift[index];
   const { warning, critical } = state.meta.severity_levels;
@@ -106,7 +121,31 @@ const engineName = (e = state.engine) => (e?.engine === SIM ? "Simulated engine"
 const truthLabel = () => state.engine?.truth_label ?? "True life left";
 // The simulated engine uses the server's alert rule (5-cycle average or LSTM),
 // so the pill on screen always agrees with the email that was or was not sent.
-const alertAt = (i) => (isSim() ? state.engine.sim?.alert_state === "alert" : isAlert(probabilityAt(i)));
+const alertAt = (i) => {
+  // Wear the models never learned always needs a person to look at it
+  if (unfamiliarAt(i)) return true;
+  if (isSim()) return state.engine.sim?.alert_state === "alert";
+  const p = probabilityAt(i);
+  if (!memoryActiveAt(i)) return isAlert(p);
+  // A raised level only filters borderline risk scores. It never silences an
+  // engine the remaining-life model puts inside the failure window.
+  const life = state.engine.predicted_rul?.[i];
+  return p >= levelAt(i) || (life != null && life <= state.meta.failure_threshold);
+};
+function memoryActiveAt(i) {
+  const m = state.engine?.alert_memory;
+  const cycle = state.engine?.cycles?.[i];
+  return Boolean(m && cycle >= m.from_cycle && cycle <= m.until_cycle);
+}
+// After a "no fault found" inspection an engine's alert level is raised for a while
+function levelAt(i) {
+  const m = state.engine?.alert_memory;
+  const cycle = state.engine?.cycles?.[i];
+  return m && cycle >= m.from_cycle && cycle <= m.until_cycle ? Math.max(state.threshold, m.level) : state.threshold;
+}
+const fleetAlert = (e) => (e.memory_level == null ? isAlert(e.probability)
+  : e.probability >= Math.max(state.threshold, e.memory_level)
+    || (e.predicted_rul != null && e.predicted_rul <= state.meta.failure_threshold));
 const hasRul = () => Array.isArray(state.engine?.predicted_rul);
 // The LSTM is trained on RUL capped at 125, so its top value means
 // "125 or more", not exactly 125.
@@ -274,7 +313,7 @@ function rulReport(r) {
 // -------------------------------------------------------------- fleet ----
 
 function renderFleet() {
-  const alerts = state.fleet.filter((e) => isAlert(e.probability));
+  const alerts = state.fleet.filter(fleetAlert);
   const failing = state.fleet.filter((e) => e.in_failure_window);
   const caught = alerts.filter((e) => e.in_failure_window);
   $("fleet-kpis").innerHTML = `
@@ -303,7 +342,7 @@ function renderFleet() {
   renderSimRow();
   for (const e of rows) {
     const li = document.createElement("li");
-    li.className = "fleet-row" + (isAlert(e.probability) ? " is-alert" : "");
+    li.className = "fleet-row" + (fleetAlert(e) ? " is-alert" : "");
     li.role = "option";
     li.tabIndex = e.engine === state.selectedEngine ? 0 : -1;
     li.dataset.engine = e.engine;
@@ -312,7 +351,8 @@ function renderFleet() {
       <span class="fleet-id" title="${e.predicted_rul == null ? "" : `LSTM predicts ${lifeText(e.predicted_rul)} cycles left; `}true value ${e.true_rul}">#${e.engine}<small>${e.predicted_rul == null ? `${e.true_rul} true` : `~${lifeText(e.predicted_rul)} left`}</small></span>
       <span class="prob">
         <span class="prob-track"><span class="prob-fill" style="width:${e.probability * 100}%"></span></span>
-        <span class="prob-text">${(e.probability * 100).toFixed(1)}% risk</span>
+        <span class="prob-text">${(e.probability * 100).toFixed(1)}% risk${e.inspect_next
+          ? ` <span class="inspect-badge" title="${e.inspect_next.join("; ")}">Inspect next</span>` : ""}</span>
       </span>
       <span class="dots" title="${e.critical_sensors} sensors near failure level, ${e.warning_sensors} drifting">
         <i class="dot" style="background:var(--crit)"></i>${e.critical_sensors}
@@ -379,11 +419,23 @@ function renderViewerHead() {
   const red = severities.filter((s) => s === "critical").length;
   const amber = severities.filter((s) => s === "warning").length;
   $("engine-title").textContent = `${engineName(e)}`;
-  $("engine-sub").textContent =
-    `${red} sensor${red === 1 ? "" : "s"} near failure level, ${amber} drifting. Scored by ${MODEL_LABELS[state.model]}.`;
+  const faulty = faultyAt(i);
+  const unfamiliar = unfamiliarAt(i);
+  $("engine-sub").classList.toggle("is-suspect", faulty.length > 0 && !unfamiliar);
+  $("engine-sub").classList.toggle("is-unfamiliar", unfamiliar);
+  $("engine-sub").textContent = unfamiliar
+    ? `Unfamiliar wear pattern: ${e.integrity.disagreeing[i]} sensors are changing in a way the models never learned. Do not trust the remaining-life estimate; inspect this engine.`
+    : faulty.length
+    ? `${faulty.map(symbolOf).join(", ")} ${faulty.length === 1 ? "looks" : "look"} faulty: ${faulty.length === 1 ? "it disagrees" : "they disagree"} with the other cross-checked sensors. Predictions use rebuilt values.`
+    : `${red} sensor${red === 1 ? "" : "s"} near failure level, ${amber} drifting. Scored by ${MODEL_LABELS[state.model]}.`;
+  const rawP = faulty.length && e.probability_raw ? e.probability_raw[i] : null;
+  const rawL = faulty.length && e.predicted_rul_raw ? e.predicted_rul_raw[i] : null;
   $("gauge").innerHTML = `
-    <div class="${alert ? "status-alert" : "status-ok"}"><dt>Failure risk</dt><dd>${(p * 100).toFixed(1)}%</dd></div>
-    ${hasRul() ? `<div><dt>Predicted life left</dt><dd>${lifeText(e.predicted_rul[i])} cycles</dd></div>` : ""}
+    <div class="${alert ? "status-alert" : "status-ok"}"><dt>Failure risk</dt><dd>${(p * 100).toFixed(1)}%${
+      rawP != null && Math.abs(rawP - p) >= 0.005 ? `<span class="raw-note" title="Before the faulty sensor was rebuilt">${(rawP * 100).toFixed(1)}%</span>` : ""}</dd></div>
+    ${hasRul() ? `<div class="${unfamiliar ? "unreliable" : ""}"><dt>Predicted life left${unfamiliar ? ` <span class="range-note">not reliable</span>`
+      : rangeText(i) ? ` <span class="range-note">${rangeText(i)}</span>` : ""}</dt><dd>${lifeText(e.predicted_rul[i])} cycles${
+      rawL != null && Math.abs(rawL - e.predicted_rul[i]) >= 1 ? `<span class="raw-note" title="Before the faulty sensor was rebuilt">${lifeText(rawL)} cycles</span>` : ""}</dd></div>` : ""}
     <div><dt>${truthLabel()}</dt><dd>${e.true_rul[i]} cycles</dd></div>
     <div class="${alert ? "status-alert" : "status-ok"}"><dt>Status</dt><dd>${alert ? "Inspect" : "Normal"}</dd></div>`;
   $("cycle-readout").textContent = `Cycle ${e.cycles[i]} of ${e.cycles[e.cycles.length - 1]}`;
@@ -415,6 +467,9 @@ function renderEngineDetail() {
         ? `<div><dt>Predicted life left</dt><dd>${lifeText(e.predicted_rul[i])}</dd></div>`
         : `<div><dt>Alert level</dt><dd>${(state.threshold * 100).toFixed(0)}%</dd></div>`}
     </dl>
+    ${integritySummary(i)}
+    ${isSim() ? "" : workshopSection()}
+    ${inspectionSection(i)}
     ${hasRul() ? `
     <h3>Remaining life, predicted and true</h3>
     <div id="rul-chart"></div>
@@ -422,7 +477,9 @@ function renderEngineDetail() {
       sensor data; dashed line is the true remaining life. The model was trained with life capped at
       ${state.meta.rul_ceiling} cycles, because early wear does not show in the sensors yet. Early in a run it
       predicts just under ${state.meta.rul_ceiling} however long the engine really has, then tracks the true line
-      once degradation becomes visible.</p>` : `
+      once degradation becomes visible.${e.predicted_range ? ` The shaded band is the likely range: on validation
+      engines the true value fell inside it ${(e.predicted_range.coverage * 100).toFixed(0)}% of the time.` : ""}</p>
+    ${confidenceText(i)}` : `
     <p class="muted" style="margin-top:1rem">No remaining-life model yet. Train it with
       <code>python -m src.train_lstm</code>; this panel fills in by itself.</p>`}
     <h3>Failure risk over the engine's run</h3>
@@ -441,6 +498,7 @@ function renderEngineDetail() {
   if (hasRul()) {
     lineChart($("rul-chart"), {
       x: e.cycles, y: e.predicted_rul, color: "var(--cobalt)", marker: i,
+      area: e.predicted_range ? { lo: e.predicted_range.lo, hi: e.predicted_range.hi, color: "rgba(31, 95, 173, 0.13)" } : null,
       yDomain: [0, Math.max(state.meta.rul_ceiling + 10, ...e.true_rul.slice(0, 1))],
       extra: [{ y: e.true_rul, color: "var(--ink)", dash: "5 4", label: isSim() ? "projected" : "true" }],
       refs: [
@@ -459,6 +517,8 @@ function renderEngineDetail() {
     label: "Failure probability by cycle",
   });
 
+  wireInspection();
+  wireWorkshop();
   const rows = $("sensor-rows");
   const order = state.meta.sensors
     .filter((s) => s.monitored)
@@ -525,8 +585,16 @@ function renderSensorDetail() {
     <h3>Effect on the failure score</h3>
     <p id="sensor-shap" class="muted">Calculating</p>
     ${meta.informative ? "" : `<p class="muted">Healthy-to-failure change is only ${meta.signal_to_noise}× this sensor's
-      normal noise, so its colour stays grey rather than presenting noise as a finding.</p>`}`;
+      normal noise, so its colour stays grey rather than presenting noise as a finding.</p>`}
+    <h3>Is the sensor itself working?</h3>
+    <div id="integrity-section"></div>
+    <h3>Maintenance inspection</h3>
+    <button class="ghost small bob-sensor-btn" id="ask-bob-sensor" type="button">🛠️ Ask Bob about this component</button>`;
   $("back").addEventListener("click", () => selectSensor(null));
+  const askBobSensorBtn = $("ask-bob-sensor");
+  if (askBobSensorBtn) askBobSensorBtn.addEventListener("click", openBobDialog);
+  renderIntegritySection(column);
+
 
   lineChart($("reading-chart"), {
     x: e.cycles, y: s.readings, color: "var(--cobalt)", marker: i,
@@ -608,6 +676,185 @@ function renderShap() {
       }
     }
   }
+}
+
+// ------------------------------------------------ inspections & workshop ----
+
+function inspectionSection(i) {
+  const e = state.engine;
+  const history = e.inspections ?? [];
+  const m = e.alert_memory;
+  const cycle = e.cycles[i];
+  const memoryNow = m && cycle >= m.from_cycle && cycle <= m.until_cycle;
+  const outcomeText = { fault_confirmed: "fault confirmed", no_fault: "no fault found" };
+  const items = history.slice().reverse().map((h) => `<li>Cycle ${h.cycle}: <b>${outcomeText[h.outcome]}</b>
+      ${h.risk != null ? `at ${(h.risk * 100).toFixed(0)}% risk` : ""}${h.note ? `, "${h.note.replace(/</g, "&lt;")}"` : ""}</li>`).join("");
+  return `
+    <h3>Inspection</h3>
+    ${memoryNow ? `<p class="integrity-ok"><b>This engine's alert level is ${(m.level * 100).toFixed(0)}%</b> until cycle
+      ${m.until_cycle}: it was inspected at ${(m.inspected_at_risk * 100).toFixed(0)}% risk on cycle ${m.from_cycle} and was
+      fine, so the same borderline reading will not send a technician straight back. This never overrides the
+      remaining-life model: if it predicts ${state.meta.failure_threshold} cycles or fewer, the engine stays flagged.</p>` : ""}
+    <p class="muted">Record what the technician found at cycle ${cycle}. "No fault found" teaches this engine's alerts to
+      wait for clearer evidence; both outcomes are labelled examples for retraining.</p>
+    <input type="text" id="inspection-note" class="inspection-note" maxlength="300" placeholder="Note (optional)">
+    <div class="override-actions">
+      <button class="ghost small" type="button" data-outcome="fault_confirmed">Fault confirmed</button>
+      <button class="ghost small" type="button" data-outcome="no_fault">No fault found</button>
+    </div>
+    ${items ? `<ul class="inspection-list">${items}</ul>` : ""}`;
+}
+
+function wireInspection() {
+  for (const b of document.querySelectorAll("[data-outcome]")) {
+    b.addEventListener("click", async () => {
+      const note = $("inspection-note")?.value ?? "";
+      try {
+        await apiPost(`/api/engine/${state.engine.engine}/inspection`, {
+          outcome: b.dataset.outcome, note, cycle: state.engine.cycles[state.cycleIndex] });
+        toast(b.dataset.outcome === "no_fault" ? "Recorded: no fault found. This engine's alert level is raised for 30 cycles."
+                                                : "Recorded: fault confirmed.");
+        document.activeElement?.blur();
+        await reloadEngine();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  }
+}
+
+function workshopSection() {
+  const g = state.engine.repair_group;
+  if (!g || !g.join.length) return "";
+  const r = state.insights.repairs;
+  const saving = r ? (() => {
+    const ind = r.policies.find((p) => p.horizon === null);
+    const grp = r.policies.find((p) => p.horizon === g.horizon);
+    return ind && grp ? ` In the fleet test, grouping like this cut workshop visits by
+      ${Math.round((1 - grp.visits / ind.visits) * 100)}% with no engine failing in service.` : "";
+  })() : "";
+  const list = g.join.slice(0, 8).map((c) => `<a href="#engine=${c.engine}" data-engine-link="${c.engine}">#${c.engine}</a>
+    <span class="muted">~${Math.round(c.predicted_rul)} left</span>`).join(", ");
+  return `<h3>Workshop plan</h3>
+    <p>When ${engineName()} goes in, also service ${list}${g.join.length > 8 ? ` and ${g.join.length - 8} more` : ""}:
+      they are predicted to need service within the next ${g.horizon} cycles anyway.${saving}</p>`;
+}
+
+function wireWorkshop() {
+  for (const a of document.querySelectorAll("[data-engine-link]")) {
+    a.addEventListener("click", (ev) => { ev.preventDefault(); selectEngine(Number(a.dataset.engineLink)); });
+  }
+}
+
+// ------------------------------------------------------------- trust ----
+
+function rangeText(i) {
+  const r = state.engine?.predicted_range;
+  if (!r) return "";
+  const ceiling = state.meta.rul_ceiling;
+  const hi = r.hi[i] >= ceiling - 0.5 ? `${ceiling}+` : Math.round(r.hi[i]);
+  return `likely ${Math.round(r.lo[i])} to ${hi}`;
+}
+
+function confidenceText(i) {
+  const r = state.engine?.predicted_range;
+  if (!r) return "";
+  const seen = i + 1;
+  return seen < r.window
+    ? `<p class="chart-caption"><b>Confidence: building.</b> ${seen} of the ${r.window} cycles the model reads are
+        recorded, so ranges are wider. On a part-worn engine fitted with new sensors, predictions settle after
+        about ${r.trusted_after} cycles of data.</p>`
+    : `<p class="chart-caption"><b>Confidence: settled.</b> The model's ${r.window}-cycle window is full.</p>`;
+}
+
+// ------------------------------------------------- sensor integrity ----
+
+function integritySummary(i) {
+  const integ = state.engine.integrity;
+  if (!integ) return "";
+  if (unfamiliarAt(i)) {
+    return `<div class="integrity-box unfamiliar-box"><b>Unfamiliar wear pattern.</b> ${integ.disagreeing[i]} of the
+      ${integ.sensors.length} cross-checked sensors disagree with the others at once. One disagreeing sensor points to a
+      broken sensor; two or more together point to a kind of wear the models were never trained on. The models learned
+      compressor wear only. On fan-wear engines from NASA's FD003 set, their remaining-life error was about ten times
+      larger, so treat the numbers on this page as unreliable and inspect the engine.</div>`;
+  }
+  const faulty = faultyAt(i);
+  if (!faulty.length) {
+    return `<p class="integrity-ok">Sensor check: all ${integ.sensors.length} cross-checked sensors agree with each other.</p>`;
+  }
+  const peers = integ.sensors.length - faulty.length;
+  const lines = faulty.map((c) => {
+    const manual = excludedByTechnician().includes(c);
+    const z = integ.z[c][i];
+    return `<b>${symbolOf(c)}</b> ${manual ? "marked faulty by a technician"
+      : `reads ${(state.engine.sensors[c].drift[i] * 100).toFixed(0)}% of the way to failure while the other ${peers}
+         agree on ${(integ.consensus[i] * 100).toFixed(0)}% (disagreement ${Math.abs(z).toFixed(1)}, alarm at ${integ.suspect_z})`}.`;
+  }).join("<br>");
+  const auto = faulty.some((c) => !excludedByTechnician().includes(c));
+  return `<div class="integrity-box">${lines}<br>That pattern points to a faulty sensor, not engine wear. Its reading is
+    rebuilt from the other sensors before the models score this engine.${auto ? ` If a second sensor starts disagreeing
+    too, the page reports an unfamiliar wear pattern instead, so check the sensor before replacing it.` : ""}</div>`;
+}
+
+function renderIntegritySection(column) {
+  const box = $("integrity-section");
+  const integ = state.engine.integrity;
+  if (!box || !integ) return;
+  const i = state.cycleIndex;
+  if (!integ.sensors.includes(column)) {
+    const loose = integ.unguarded.includes(column);
+    box.innerHTML = `<p class="muted">${loose
+      ? `${symbolOf(column)} follows engine wear too loosely to be cross-checked against the other sensors, so the
+         guard cannot tell a fault on it from normal scatter.`
+      : `${symbolOf(column)} carries too little signal to be cross-checked.`}</p>`;
+    return;
+  }
+  const flagged = integrityFlag(column, i);
+  const manual = excludedByTechnician().includes(column);
+  const peers = integ.sensors.length - 1;
+  box.innerHTML = `
+    <p>${flagged
+      ? `<b style="color:var(--suspect)">${manual ? "Marked faulty by a technician." : "Suspected fault."}</b>`
+      : "Agrees with the other sensors."}
+      This sensor says the engine is ${(state.engine.sensors[column].drift[i] * 100).toFixed(0)}% of the way to failure;
+      the other ${peers} cross-checked sensors agree on ${(integ.consensus[i] * 100).toFixed(0)}%.</p>
+    <div id="integrity-chart"></div>
+    <p class="chart-caption">Disagreement with the other cross-checked sensors, in multiples of this sensor's normal
+      scatter on training engines. A fault is flagged above ${integ.suspect_z} for ${integ.persist_cycles} cycles in a row.</p>
+    <div class="override-actions">
+      <button class="ghost small" id="mark-faulty" type="button">${manual ? "Trust this sensor again" : "Mark sensor as faulty"}</button>
+    </div>
+    <p class="muted" style="margin-top:0.3rem">A technician who knows a sensor is bad can exclude it. Its value is then
+      rebuilt from the other sensors and every prediction is recalculated.</p>`;
+  const z = integ.z[column].map(Math.abs);
+  lineChart($("integrity-chart"), {
+    x: state.engine.cycles, y: z, color: "var(--suspect)", marker: i,
+    yDomain: [0, Math.max(integ.suspect_z * 1.6, ...z.filter(Number.isFinite))],
+    refs: [{ y: integ.suspect_z, label: "Fault threshold", color: "var(--suspect)" }],
+    format: (v) => v.toFixed(1), label: `${symbolOf(column)} disagreement by cycle`,
+  });
+  $("mark-faulty").addEventListener("click", async () => {
+    try {
+      await apiPost(`/api/engine/${state.engine.engine}/sensor-note`, { sensor: column, faulty: !manual });
+      toast(manual ? `${symbolOf(column)} trusted again` : `${symbolOf(column)} excluded; predictions recalculated`);
+      await reloadEngine();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+}
+
+// Fetch the selected engine again, keeping the cycle and selected sensor
+async function reloadEngine() {
+  if (isSim()) { await pollSim({ force: true }); return; }
+  const keepIndex = state.cycleIndex, sensor = state.selectedSensor;
+  state.engine = await api(`/api/engine/${state.selectedEngine}?model=${state.model}`);
+  state.cycleIndex = Math.min(keepIndex, state.engine.cycles.length - 1);
+  state.selectedSensor = sensor;
+  state.explain = null;
+  await loadFleet();
+  renderCycle();
 }
 
 function renderDetail() {
@@ -885,9 +1132,18 @@ async function setModel(model) {
   if (sensor) selectSensor(sensor);
 }
 
+async function loadInsights() {
+  for (const name of ["trust", "inspection", "repairs", "sensor_kit", "unfamiliar", "adaptation", "integrity"]) {
+    const r = await api(`/api/insights/${name}`).catch(() => null);
+    state.insights[name] = r?.available ? r : null;
+    state.insightCommands = { ...(state.insightCommands || {}), [name]: r?.command };
+  }
+}
+
 async function loadFleet() {
   const result = await api(`/api/fleet?model=${state.model}`);
   state.fleet = result.engines;
+  state.fleetPlan = { inspectNext: result.inspect_next ?? [], repairPlan: result.repair_plan ?? null };
   fitThresholdToModel();
   renderFleet();
 }
@@ -944,13 +1200,428 @@ $("reset-view").addEventListener("click", () => selectSensor(null));
 $("callout").addEventListener("click", () => $("detail").scrollTo({ top: 0, behavior: "smooth" }));
 $("open-report").addEventListener("click", () => $("report").showModal());
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && state.selectedSensor && !$("report").open) selectSensor(null);
+  if (e.key === "Escape" && state.selectedSensor && !$("report").open && !$("insights-dialog").open && !($("bob-dialog") && $("bob-dialog").open)) selectSensor(null);
 });
 let resizeTimer;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => state.engine && renderDetail(), 150);
 });
+
+// ----------------------------------------------------------- foldable sidebars ----
+const layoutEl = $("main-layout");
+const toggleFleetBtn = $("toggle-fleet");
+const toggleDetailBtn = $("toggle-detail");
+
+if (toggleFleetBtn && layoutEl) {
+  toggleFleetBtn.addEventListener("click", () => {
+    const isCollapsed = layoutEl.classList.toggle("fleet-collapsed");
+    toggleFleetBtn.textContent = isCollapsed ? "▶ Fleet" : "◀ Fleet";
+    toggleFleetBtn.title = isCollapsed ? "Expand Fleet sidebar" : "Collapse Fleet sidebar";
+    window.dispatchEvent(new Event("resize"));
+  });
+}
+
+if (toggleDetailBtn && layoutEl) {
+  toggleDetailBtn.addEventListener("click", () => {
+    const isCollapsed = layoutEl.classList.toggle("detail-collapsed");
+    toggleDetailBtn.textContent = isCollapsed ? "◀ Details" : "Details ▶";
+    toggleDetailBtn.title = isCollapsed ? "Expand Details panel" : "Collapse Details panel";
+    window.dispatchEvent(new Event("resize"));
+  });
+}
+
+// ----------------------------------------------------------- bob the mechanic ----
+let bobProvidersLoaded = false;
+
+async function loadBobProviders() {
+  const sel = $("bob-provider-select");
+  if (!sel) return;
+  try {
+    const res = await api("/api/bob/providers");
+    if (res.providers) {
+      sel.innerHTML = res.providers.map(p =>
+        `<option value="${p.id}" ${p.id === "template" ? "selected" : ""}>
+          ${p.label} ${p.available ? "" : "(not configured)"}
+        </option>`
+      ).join("");
+      bobProvidersLoaded = true;
+    }
+  } catch (err) {
+    console.error("Failed to load Bob providers", err);
+  }
+}
+
+async function openBobDialog() {
+  const dialog = $("bob-dialog");
+  if (!dialog) return;
+  dialog.showModal();
+  if (!bobProvidersLoaded) {
+    await loadBobProviders();
+  }
+  await fetchAndRenderBobWorkOrder();
+}
+
+async function fetchAndRenderBobWorkOrder() {
+  const body = $("bob-body");
+  if (!body) return;
+  const sel = $("bob-provider-select");
+  const prov = sel ? sel.value : "template";
+  const eng = state.selectedEngine || "sim";
+  const cycle = (state.engine && state.engine.cycles) ? state.engine.cycles[state.cycleIndex] : null;
+
+  body.innerHTML = `
+    <div style="padding: 2.5rem; text-align: center; color: var(--graphite)">
+      <div class="sync-dot" style="display:inline-block; margin-bottom: 0.5rem"></div>
+      <p style="margin: 0; font-size: var(--step-0)">Consulting Bob the mechanic & checking guardrails...</p>
+    </div>`;
+
+  try {
+    let url = `/api/bob/workorder/${eng}?model=${state.model}&threshold=${state.threshold}&provider=${prov}`;
+    if (cycle !== null && cycle !== undefined) url += `&cycle=${cycle}`;
+    const wo = await api(url);
+    renderBobWorkOrder(wo);
+  } catch (err) {
+    body.innerHTML = `
+      <div class="banner">
+        <b>Could not generate work order:</b> ${escapeHtml(err.message || String(err))}
+      </div>`;
+  }
+}
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function renderBobWorkOrder(wo) {
+  const body = $("bob-body");
+  if (!body) return;
+
+  const prioClass = (wo.priority || "routine").toLowerCase();
+  const lifeText = wo.rul !== null ? `${Math.round(wo.rul)} ${escapeHtml(wo.time_unit)}s` +
+    (wo.rul_range ? ` (likely ${Math.round(wo.rul_range[0])}–${Math.round(wo.rul_range[1])})` : "") +
+    (wo.rul_reliable ? "" : " <span style='color:var(--crit)'>— not reliable</span>") : "N/A";
+
+  const compChips = (wo.components || []).map(c =>
+    `<span class="bob-comp-chip">${escapeHtml(c.name || c.id)}</span>`
+  ).join("") || "<span class='muted'>No components flagged</span>";
+
+  const stepItems = (wo.steps || []).map((s, idx) => `
+    <li class="bob-checklist-item">
+      <input type="checkbox" id="bob-step-${idx}">
+      <label for="bob-step-${idx}">
+        <span class="comp-tag">[${escapeHtml(s.component_name || s.component)}]</span>
+        ${escapeHtml(s.text)}
+      </label>
+    </li>
+  `).join("") || "<li class='bob-checklist-item'><span class='muted'>No immediate component actions needed. Continue routine monitoring.</span></li>";
+
+  const evidenceItems = (wo.evidence || []).map(e =>
+    `<li>${escapeHtml(e)}</li>`
+  ).join("");
+
+  const guardrailBadge = wo.guardrail && wo.guardrail.valid && wo.guardrail.agrees
+    ? `<span class="bob-guardrail-ok">✓ Verified by guardrail (matches profile schema & checklist)</span>`
+    : `<span class="bob-guardrail-warn">⚠ Fallback template used (${escapeHtml((wo.guardrail?.problems || []).join(", ") || "verification failed")})</span>`;
+
+  body.innerHTML = `
+    <div class="bob-meta-banner">
+      <div class="bob-meta-item">
+        <span class="bob-meta-label">Work Order ID</span>
+        <span class="bob-meta-val">${escapeHtml(wo.id)}</span>
+      </div>
+      <div class="bob-meta-item">
+        <span class="bob-meta-label">Equipment</span>
+        <span class="bob-meta-val">${escapeHtml(wo.machine_name)} · ${escapeHtml(wo.unit_label)} ${escapeHtml(String(wo.unit))}</span>
+      </div>
+      <div class="bob-meta-item">
+        <span class="bob-meta-label">Priority</span>
+        <span class="bob-meta-val"><span class="bob-badge ${prioClass}">${escapeHtml(wo.priority)}</span></span>
+      </div>
+      <div class="bob-meta-item">
+        <span class="bob-meta-label">Model Status</span>
+        <span class="bob-meta-val">${escapeHtml((wo.status || "").toUpperCase())}</span>
+      </div>
+      <div class="bob-meta-item">
+        <span class="bob-meta-label">Failure Risk</span>
+        <span class="bob-meta-val">${(wo.risk * 100).toFixed(1)}%</span>
+      </div>
+      <div class="bob-meta-item">
+        <span class="bob-meta-label">Predicted Life</span>
+        <span class="bob-meta-val">${lifeText}</span>
+      </div>
+    </div>
+
+    <div class="bob-summary-box">
+      <p><b>Summary:</b> ${escapeHtml(wo.summary)}</p>
+      ${(wo.notes || []).map(n => `<p style="color:var(--graphite);font-size:var(--step--1)">ℹ️ ${escapeHtml(n)}</p>`).join("")}
+    </div>
+
+    <div class="bob-section">
+      <h3>Suspected Components</h3>
+      <div class="bob-components-list">${compChips}</div>
+    </div>
+
+    <div class="bob-section">
+      <h3>Inspection Checklist</h3>
+      <ul class="bob-checklist-items">${stepItems}</ul>
+    </div>
+
+    <div class="bob-section">
+      <h3>Model Findings & Telemetry Evidence</h3>
+      <ul class="bob-evidence-list">${evidenceItems}</ul>
+    </div>
+
+    <div class="bob-guardrail-card">
+      <div>${guardrailBadge}</div>
+      <div>Written by: <b>${escapeHtml(wo.provider)}</b></div>
+    </div>
+
+    <!-- Bob Technician Chat Section -->
+    <div class="bob-chat-section">
+      <div class="bob-chat-header">
+        <div class="bob-chat-title">
+          <span class="bob-chat-avatar">🛠️</span>
+          <div>
+            <h4>Chat with Bob</h4>
+            <p class="viewer-sub" style="margin:2px 0 0">Interactive maintenance advisor · Bob explains, models decide</p>
+          </div>
+        </div>
+        <div class="bob-chat-meta">
+          <span class="bob-chat-badge">Model-Grounded</span>
+        </div>
+      </div>
+
+      <div class="bob-quick-prompts" id="bob-quick-prompts">
+        <button type="button" class="bob-chip" data-prompt="Why was this component flagged for inspection?">🔍 Why flagged?</button>
+        <button type="button" class="bob-chip" data-prompt="What tools and safety precautions do I need for this checklist?">🧰 Tools & safety</button>
+        <button type="button" class="bob-chip" data-prompt="Can this engine operate for another cycle before servicing?">⏱️ Run another cycle?</button>
+        <button type="button" class="bob-chip" data-prompt="Explain the sensor drift and what abnormal reading means.">📊 Explain sensor drift</button>
+      </div>
+
+      <div class="bob-chat-history" id="bob-chat-history"></div>
+
+      <form class="bob-chat-form" id="bob-chat-form" onsubmit="return false;">
+        <div class="bob-chat-input-wrapper">
+          <span class="bob-input-icon" title="Chat with Bob">💬</span>
+          <input type="text" id="bob-chat-input" class="bob-chat-input" placeholder="Text Bob: ask about this machine, checklist, or sensors..." autocomplete="off">
+          <button type="button" id="bob-chat-send" class="bob-chat-send-btn" title="Send message to Bob">
+            <span>Send</span>
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+              <path d="M1.5 1.5l13 6.5-13 6.5v-5l8-1.5-8-1.5v-5z"/>
+            </svg>
+          </button>
+        </div>
+      </form>
+    </div>
+  `;
+
+  const unitKey = `${wo.machine_name || "engine"}-${wo.unit}-${wo.id}`;
+  if (state.bobChat.currentUnit !== unitKey || state.bobChat.history.length === 0) {
+    state.bobChat.currentUnit = unitKey;
+    const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const compNames = (wo.components || []).map(c => c.name || c.id).join(", ");
+    state.bobChat.history = [{
+      role: "assistant",
+      content: `Hello! I'm Bob the shop mechanic. I've prepared work order ${wo.id} for ${wo.unit_label || "Engine"} ${wo.unit}. ` +
+               (compNames ? `My primary focus is on the ${compNames}. ` : "The unit is currently within normal operating parameters. ") +
+               `You can text me below to ask about inspection steps, required tools, sensor trends, or safety precautions!`,
+      provider: wo.provider,
+      guardrail: wo.guardrail,
+      time: now,
+    }];
+  }
+
+  renderBobChatHistory();
+
+  const chatForm = $("bob-chat-form");
+  const chatInput = $("bob-chat-input");
+  const sendBtn = $("bob-chat-send");
+
+  const submitChat = (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    if (chatInput && chatInput.value.trim()) {
+      const val = chatInput.value.trim();
+      chatInput.value = "";
+      sendBobMessage(val);
+    }
+  };
+
+  if (chatForm) {
+    chatForm.addEventListener("submit", submitChat);
+  }
+  if (sendBtn) {
+    sendBtn.addEventListener("click", submitChat);
+  }
+  if (chatInput) {
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        submitChat(e);
+      }
+    });
+  }
+
+  const chips = document.querySelectorAll("#bob-quick-prompts .bob-chip");
+  chips.forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const prompt = btn.getAttribute("data-prompt");
+      if (prompt) sendBobMessage(prompt);
+    });
+  });
+}
+
+function renderBobChatHistory() {
+  const container = $("bob-chat-history");
+  if (!container) return;
+  const history = state.bobChat.history || [];
+
+  if (history.length === 0) {
+    container.innerHTML = `<div style="text-align:center; padding: 1.5rem; color: var(--graphite); font-size: var(--step--1)">No messages yet. Ask Bob anything about this machine's telemetry or maintenance steps!</div>`;
+    return;
+  }
+
+  container.innerHTML = history.map(m => {
+    if (m.role === "user") {
+      return `
+        <div class="bob-msg user">
+          <div class="bob-msg-meta"><span>Technician</span> <span>${escapeHtml(m.time || "")}</span></div>
+          <div class="bob-msg-text">${escapeHtml(m.content)}</div>
+        </div>`;
+    }
+    const guardrailTag = m.guardrail && m.guardrail.valid
+      ? `<span style="color:var(--ok);font-size:0.68rem">✓ Grounded</span>`
+      : "";
+    const provTag = m.provider ? `<span style="font-size:0.68rem;opacity:0.8">${escapeHtml(m.provider)}</span>` : "";
+    return `
+      <div class="bob-msg assistant">
+        <div class="bob-msg-meta">
+          <span>🛠️ Bob the mechanic</span>
+          ${provTag}
+          ${guardrailTag}
+          <span style="margin-left:auto">${escapeHtml(m.time || "")}</span>
+        </div>
+        <div class="bob-msg-text">${escapeHtml(m.content)}</div>
+      </div>`;
+  }).join("");
+
+  if (state.bobChat.sending) {
+    container.innerHTML += `
+      <div class="bob-typing">
+        <span class="sync-dot"></span>
+        <span>Bob is analyzing findings & checking machine profile...</span>
+      </div>`;
+  }
+
+  container.scrollTop = container.scrollHeight;
+}
+
+async function sendBobMessage(text) {
+  text = (text || "").trim();
+  if (!text || state.bobChat.sending) return;
+
+  const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  state.bobChat.history.push({ role: "user", content: text, time: now });
+  state.bobChat.sending = true;
+  renderBobChatHistory();
+
+  const sel = $("bob-provider-select");
+  const prov = sel ? sel.value : "template";
+  const eng = state.selectedEngine || "sim";
+  const cycle = (state.engine && state.engine.cycles) ? state.engine.cycles[state.cycleIndex] : null;
+
+  try {
+    const payload = {
+      engine_id: eng,
+      cycle: cycle,
+      model: state.model,
+      threshold: state.threshold,
+      provider: prov,
+      message: text,
+      history: state.bobChat.history.map(h => ({ role: h.role, content: h.content })),
+    };
+    const res = await apiPost("/api/bob/chat", payload);
+    const replyTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    state.bobChat.history.push({
+      role: "assistant",
+      content: res.reply || "No reply from Bob.",
+      provider: res.provider || prov,
+      guardrail: res.guardrail,
+      time: replyTime,
+    });
+  } catch (err) {
+    state.bobChat.history.push({
+      role: "assistant",
+      content: `Sorry, I couldn't process that: ${err.message || String(err)}. You can try asking about specific flagged sensors or checklist items.`,
+      provider: "system",
+      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    });
+  } finally {
+    state.bobChat.sending = false;
+    renderBobChatHistory();
+    const input = $("bob-chat-input");
+    if (input) input.focus();
+  }
+}
+
+function closeBobDialog() {
+  const dialog = $("bob-dialog");
+  if (dialog) dialog.close();
+}
+
+const bobCloseBtn = $("bob-close-btn");
+if (bobCloseBtn) bobCloseBtn.addEventListener("click", closeBobDialog);
+
+const bobDialog = $("bob-dialog");
+if (bobDialog) {
+  bobDialog.addEventListener("click", (evt) => {
+    // Only close if the click was directly on the dialog itself (the backdrop), never on children
+    if (evt.target !== bobDialog) return;
+    const rect = bobDialog.getBoundingClientRect();
+    const isInDialog = (
+      rect.top <= evt.clientY && evt.clientY <= rect.top + rect.height &&
+      rect.left <= evt.clientX && evt.clientX <= rect.left + rect.width
+    );
+    if (!isInDialog) {
+      bobDialog.close();
+    }
+  });
+}
+
+$("open-bob").addEventListener("click", openBobDialog);
+const openBobMini = $("open-bob-mini");
+if (openBobMini) openBobMini.addEventListener("click", openBobDialog);
+
+const bobProvSelect = $("bob-provider-select");
+if (bobProvSelect) {
+  bobProvSelect.addEventListener("change", () => fetchAndRenderBobWorkOrder());
+}
+
+const bobPrintBtn = $("bob-print-btn");
+if (bobPrintBtn) {
+  bobPrintBtn.addEventListener("click", () => {
+    const sel = $("bob-provider-select");
+    const prov = sel ? sel.value : "template";
+    const eng = state.selectedEngine || "sim";
+    const cycle = (state.engine && state.engine.cycles) ? state.engine.cycles[state.cycleIndex] : null;
+    let url = `/api/bob/workorder/${eng}/html?model=${state.model}&threshold=${state.threshold}&provider=${prov}`;
+    if (cycle !== null && cycle !== undefined) url += `&cycle=${cycle}`;
+    window.open(url, "_blank");
+  });
+}
+
 
 // ------------------------------------------------------------ simulation ----
 
@@ -1041,6 +1712,12 @@ function renderSimBar() {
   segment($("sim-speed"), sim.speeds, sim.speed, (v) => `${v}×`, "speed");
   segment($("sim-wear"), sim.wear_presets, sim.wear, (v) => v[0].toUpperCase() + v.slice(1), "wear");
   $("sim-fault").setAttribute("aria-pressed", String(sim.fault));
+  $("sim-fan").setAttribute("aria-pressed", String(Boolean(sim.fan_fault)));
+  $("sim-fan").disabled = !sim.fan_available || sim.fan_fault;
+  $("sim-fan").textContent = sim.fan_fault ? "Unfamiliar fault active" : "Inject unfamiliar fault";
+  const broken = sim.overrides?.[DEMO_BREAK_SENSOR] != null;
+  $("sim-break").setAttribute("aria-pressed", String(broken));
+  $("sim-break").textContent = broken ? `Repair ${symbolOf(DEMO_BREAK_SENSOR)}` : "Break a sensor";
   $("sim-fault").textContent = sim.fault ? "HPC fault active" : "Inject HPC fault";
 
   // Share of the engine's expected life already used, at the current wear
@@ -1063,6 +1740,18 @@ $("sim-play").addEventListener("click", () => {
 });
 $("sim-fault").addEventListener("click", () => simControl("fault", { value: !state.engine?.sim?.fault }));
 $("sim-reset").addEventListener("click", () => simControl("reset"));
+$("sim-fan").addEventListener("click", () => {
+  if (state.engine?.sim?.fan_fault) return;
+  simControl("fan_fault", { value: true });
+  toast("Unfamiliar fault injected: the engine now wears like FD003's fan-degradation engines.");
+});
+$("sim-break").addEventListener("click", () => {
+  const broken = state.engine?.sim?.overrides?.[DEMO_BREAK_SENSOR] != null;
+  const failure = state.simRanges?.[DEMO_BREAK_SENSOR]?.failure;
+  simControl("override", { column: DEMO_BREAK_SENSOR, value: broken ? null : failure });
+  toast(broken ? `${symbolOf(DEMO_BREAK_SENSOR)} repaired: it reads the real engine again`
+               : `${symbolOf(DEMO_BREAK_SENSOR)} broken: stuck at its failure level. Watch the guard catch it.`);
+});
 $("sim-demo").addEventListener("click", () => {
   setView("engine");
   simControl("demo");
@@ -1130,6 +1819,7 @@ let ruleTimer = null;
 function syncAlertRule() {
   clearTimeout(ruleTimer);
   ruleTimer = setTimeout(() => apiPost("/api/alerts/rule", { threshold: state.threshold, model: state.model })
+    .then(() => state.meta && loadFleet())
     .catch(() => {}), 250);
 }
 
@@ -1141,7 +1831,10 @@ async function refreshAlerts({ announce }) {
     for (const e of fresh.reverse()) {
       const where = e.status === "not_configured" ? "logged here; email is not set up"
         : `emailing ${e.recipients.join(", ")}`;
-      toast(e.kind === "alert" ? `Alert: ${e.engine} needs inspection (${where})` : `${e.engine} is back to normal (${where})`);
+      toast(e.kind === "alert" ? `Alert: ${e.engine} needs inspection (${where})`
+        : e.kind === "sensor_fault" ? `Sensor fault on ${e.engine}: ${e.drivers?.[0]?.symbol ?? "a sensor"} is unreliable (${where})`
+        : e.kind === "unfamiliar" ? `Unfamiliar wear on ${e.engine}: don't trust its remaining-life estimate (${where})`
+        : `${e.engine} is back to normal (${where})`);
     }
   }
   state.alertsSeen = Math.max(state.alertsSeen, data.last_id);
@@ -1170,8 +1863,10 @@ function renderAlerts() {
     : `<div class="email-box is-off"><b>Email is not set up yet.</b> Alerts still appear here and as pop-ups.
         To get them by email, copy <code>.env.example</code> to <code>.env</code> in the project folder and fill in
         ${em.missing.map((m) => `<code>${m}</code>`).join(", ")}. No restart is needed.</div>`;
-  const kindColor = { alert: "var(--crit)", recovered: "var(--ok)", test: "var(--cobalt)" };
-  const kindText = { alert: "Alert", recovered: "Recovered", test: "Test" };
+  const kindColor = { alert: "var(--crit)", recovered: "var(--ok)", test: "var(--cobalt)", sensor_fault: "var(--suspect)",
+                      unfamiliar: "var(--warn)" };
+  const kindText = { alert: "Alert", recovered: "Recovered", test: "Test", sensor_fault: "Sensor fault",
+                     unfamiliar: "Unfamiliar wear" };
   const items = data.entries.length ? data.entries.map((e) => `
     <li class="alert-entry">
       <div class="alert-entry-head">
@@ -1202,6 +1897,249 @@ $("open-alerts").addEventListener("click", async () => {
   $("alerts-dialog").showModal();
 });
 
+// ------------------------------------------------------- fleet insights ----
+// The measured evidence behind each new feature (from the offline analyses,
+// python -m src.trust and friends), next to what it suggests for this fleet now.
+
+const INSIGHT_TABS = [
+  ["integrity", "Sensor guard"],
+  ["trust", "Time to trust"],
+  ["inspection", "Inspect next"],
+  ["repairs", "Group repairs"],
+  ["sensor_kit", "Sensor kit"],
+  ["unfamiliar", "Unfamiliar wear"],
+  ["adaptation", "New fleet"],
+];
+const STRATEGY_STYLE = {
+  "explore, then least sure": { color: "var(--cobalt)", dash: "none", label: "Explore, then least sure", short: "explore+sure" },
+  "least sure": { color: "var(--graphite)", dash: "5 4", label: "Least sure only", short: "least sure" },
+  random: { color: "var(--ink)", dash: "2 3", label: "Random", short: "random" },
+  riskiest: { color: "var(--low)", dash: "8 3 2 3", label: "Riskiest first", short: "riskiest" },
+};
+let insightTab = INSIGHT_TABS[0][0];
+
+const share = (v) => `${Math.round(v * 100)}%`;
+const signed = (v) => (v > 0 ? `+${v}` : `${v}`);
+const engineLinks = (ids) => ids.map((id) => `<a href="#engine=${id}" data-insight-engine="${id}">#${id}</a>`).join(", ");
+const strategyStyle = (name) => STRATEGY_STYLE[name] ?? { color: "var(--graphite)", dash: "none", label: name, short: name };
+const lineLegend = (items) => `<ul class="insight-legend">${items.map((s) => `<li><svg width="26" height="8" aria-hidden="true">
+  <line x1="0" x2="26" y1="4" y2="4" stroke="${s.color}" stroke-width="2" stroke-dasharray="${s.dash}"/></svg>${s.label}</li>`).join("")}</ul>`;
+
+const INSIGHT_VIEWS = {
+  integrity(body, r) {
+    const head = `<thead><tr><th>Fault added</th><th>Caught</th><th>Wrong sensor blamed</th><th>Cycles to catch (median)</th></tr></thead>`;
+    const rows = (list) => list.map((f) => `<tr><td>${f.fault}</td><td>${share(f.detected)}</td><td>${share(f.wrong)}</td>
+      <td>${f.median_delay == null ? "–" : Math.round(f.median_delay)}</td></tr>`).join("");
+    const s = r.stuck_sensor_on_healthy_engines;
+    body.innerHTML = `
+      <p>Every cross-checked sensor is compared with what the others say about the engine's wear. A sensor that keeps
+        disagreeing is marked as a suspected fault, its reading is rebuilt from the others, and the models are
+        re-scored on the rebuilt reading. Cross-checked: ${r.guarded.join(", ")}. Not cross-checkable:
+        ${r.unguarded.join(", ")}, whose normal disagreement is too large to tell a fault from noise.</p>
+      <p class="muted">With no fault added, ${r.clean_test_engines_flagged} of the 100 test engines had any sensor flagged.
+        Below, one fault was added to each engine's real recording, rotating through the sensors.</p>
+      <h3>Test engines, fault starting 30 cycles before the recording ends</h3>
+      <table class="metrics insight-table">${head}<tbody>${rows(r.test)}</tbody></table>
+      <h3>Validation engines run to failure, fault starting 60 cycles before failure</h3>
+      <table class="metrics insight-table">${head}<tbody>${rows(r.run_to_failure)}</tbody></table>
+      <p class="muted">A frozen sensor only stands out once the engine's real wear moves away from the frozen value. The
+        test recordings stop before that, which is why frozen sensors are caught far more often on engines run to failure.</p>
+      ${s ? `<p>On ${s.engines} healthy engines with one sensor stuck at its failure level, the LSTM's remaining-life error
+        is <b>${s.lstm_mae_without}</b> cycles without the guard and <b>${s.lstm_mae_with}</b> with it. False failure alarms:
+        ${s.false_alarms_without} without, ${s.false_alarms_with} with.</p>` : ""}`;
+  },
+
+  trust(body, r) {
+    // error = predicted - true, so the truth sits between prediction - q90 and prediction - q10
+    const range = (q) => `${signed(Math.round(-q.q90))} to ${signed(Math.round(-q.q10))} cycles`;
+    const ceiling = state.meta.rul_ceiling;
+    const bandRows = r.ranges.settled.map((q, k) => `<tr><td>${q.band[0]} to ${Math.min(q.band[1], ceiling)}</td>
+      <td>${range(r.ranges.building[k])}</td><td>${range(q)}</td></tr>`).join("");
+    body.innerHTML = `
+      <p>Sensors fitted to a part-worn engine start with no history. To measure how long the LSTM needs before its
+        predictions can be trusted, each of the ${r.engines} validation engines was first monitored
+        ${r.late_starts.join(", ")} cycles before failure, and the error tracked as data built up.</p>
+      <div class="insight-chart" id="trust-chart"></div>
+      <p class="chart-caption">Average error, in cycles, against cycles of data recorded. The dashed line is the error once
+        the model's ${r.window}-cycle window is full (${r.settled_mae.toFixed(1)} cycles). Predictions come within 15% of
+        that after about <b>${r.trusted_after} cycles</b>.</p>
+      <h3>Likely range shown with each prediction</h3>
+      <table class="metrics insight-table"><thead><tr><th>Predicted life</th><th>First ${r.window} cycles of data</th>
+        <th>After ${r.window} cycles</th></tr></thead><tbody>${bandRows}</tbody></table>
+      <p class="muted">The true life lies within this range of the prediction for 80% of cycles, measured from the LSTM's own
+        errors on the validation engines. Checked on those engines, the truth landed inside its range ${share(r.coverage)}
+        of the time.</p>`;
+    const top = Math.max(...r.curve.map((c) => c.mae));
+    lineChart($("trust-chart"), {
+      x: r.curve.map((c) => c.to), y: r.curve.map((c) => c.mae), color: "var(--cobalt)", height: 180,
+      yDomain: [0, Math.ceil(top / 5) * 5 + 5],
+      refs: [{ y: r.settled_mae, color: "var(--graphite)" }],
+      hoverX: (x) => `Up to ${x} cycles of data:`, format: (v) => formatValue(v, 1), label: "Prediction error against cycles of data",
+    });
+  },
+
+  inspection(body, r) {
+    const names = Object.keys(r.mean_auc);
+    const last = r.inspections.length - 1;
+    const rows = names.map((n) => `<tr><td>${strategyStyle(n).label}</td>
+      <td>${r.inspections_to_target[n] ?? "not reached"}</td><td>${r.mean_auc[n][last].toFixed(3)}</td></tr>`).join("");
+    const now = state.fleetPlan?.inspectNext ?? [];
+    body.innerHTML = `
+      <p>Inspections are the costly part of collecting labels, so each one should teach the model as much as possible. A
+        classifier starts from ${r.start} inspected moments (an engine at one cycle, found worn or not) and gains
+        ${r.per_round} per round. Wear only goes one way, so a healthy finding also labels the engine's earlier cycles and a
+        worn one its later cycles. Scored on the 100 test engines, mean of ${r.seeds} random starts.</p>
+      <div class="insight-chart" id="inspect-chart"></div>
+      ${lineLegend([...names.map(strategyStyle), { color: "var(--unmon)", dash: "none", label: `Target, ROC-AUC ${r.target_auc}` }])}
+      <table class="metrics insight-table"><thead><tr><th>Choosing the next inspections</th>
+        <th>Inspections to reach ROC-AUC ${r.target_auc}</th><th>ROC-AUC after ${r.inspections[last]}</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      <p class="muted">Inspecting at random while the model is too weak to judge its own doubt, then the engines it is least
+        sure about, gave the best final accuracy. Inspecting the riskiest engines first, a common practice, teaches the
+        model least: it already knows those engines are worn.</p>
+      <h3>Inspect next in this fleet</h3>
+      ${now.length ? `<ol class="inspection-list">${now.map((d) => `<li>${engineLinks([d.engine])}: ${d.reasons.join("; ")}</li>`).join("")}</ol>`
+                   : `<p class="muted">No engine needs a second opinion right now.</p>`}`;
+    const [main, ...rest] = names;
+    lineChart($("inspect-chart"), {
+      x: r.inspections, y: r.mean_auc[main], color: strategyStyle(main).color, height: 210,
+      yDomain: [Math.floor(Math.min(...Object.values(r.mean_auc).flat()) * 50) / 50, 1],
+      seriesLabel: strategyStyle(main).short,
+      extra: rest.map((n) => ({ y: r.mean_auc[n], ...strategyStyle(n), label: strategyStyle(n).short })),
+      refs: [{ y: r.target_auc, color: "var(--unmon)", dash: "none" }],
+      hoverX: (x) => `${x} inspections:`, format: (v) => formatValue(v, 3), label: "ROC-AUC against inspections",
+    });
+  },
+
+  repairs(body, r) {
+    const individual = r.policies.find((p) => p.horizon === null);
+    const rows = r.policies.map((p) => `<tr${p.horizon === r.default_horizon ? ` class="is-chosen"` : ""}>
+      <td>${p.horizon === null ? "Each engine alone" : `Grouped, ${p.horizon} cycles ahead`}</td>
+      <td>${p.visits.toFixed(1)}</td><td>${p.horizon === null ? "–" : `${Math.round((1 - p.visits / individual.visits) * 100)}% fewer`}</td>
+      <td>${p.failures_in_service}</td><td>${p.mean_life_left_at_service.toFixed(1)}</td></tr>`).join("");
+    const plan = state.fleetPlan?.repairPlan;
+    const live = !plan ? `<p class="muted">Needs the LSTM's predictions; train it with <code>python -m src.train_lstm</code>.</p>`
+      : plan.due.length ? `<p>Due now (predicted life ${plan.safety} cycles or less): ${engineLinks(plan.due)}.
+          ${plan.join.length ? `Send with them: ${engineLinks(plan.join)}, predicted to be due within the next ${plan.horizon} cycles.`
+                             : `No other engine is due within the next ${plan.horizon} cycles.`}</p>`
+      : `<p class="muted">No engine is due yet${plan.join.length ? `. When the next one is, ${engineLinks(plan.join)} should go with it` : ""}.</p>`;
+    body.innerHTML = `
+      <p>Every workshop visit has a fixed cost. Servicing each engine alone, at the last safe moment, wastes little life but
+        needs many visits. Grouping engines that are close to service into one visit saves visits, at the price of
+        servicing some a little early.</p>
+      <p class="muted">The ${r.engines} validation engines were placed on one calendar with start dates spread over
+        ${r.stagger_cycles} cycles, like a fleet bought over time, and run forward on the LSTM's real prediction at every
+        cycle. An engine goes in when its predicted life reaches ${r.safety} cycles. Mean of ${r.repeats} random calendars.</p>
+      <table class="metrics insight-table"><thead><tr><th>Policy</th><th>Workshop visits</th><th>Saving</th>
+        <th>Failures in service</th><th>True life left at service</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted">Highlighted: the ${r.default_horizon}-cycle grouping the engine panels use.</p>
+      <h3>This fleet's next workshop visit</h3>
+      ${live}`;
+  },
+
+  sensor_kit(body, r) {
+    const steps = [...r.steps].sort((a, b) => a.size - b.size);
+    const kit = r.smallest_equivalent;
+    const order = [...r.steps].filter((s) => s.removed).map((s) => s.removed);
+    const lstmRows = r.lstm.map((l) => `<tr><td>${l.size}</td><td>${l.sensors.join(", ")}</td><td>${l.test_rmse.toFixed(2)}</td>
+      <td>${l.test_mae.toFixed(2)}</td></tr>`).join("");
+    body.innerHTML = `
+      <p>Fitting sensors to existing equipment costs money for every channel. Starting from all ${r.steps[0].size} sensors the
+        models use, the sensor whose loss hurt least was removed and the classifier retrained, one at a time. Choices were
+        made on the validation engines only; every kit was then scored on the 100 test engines.</p>
+      <p><b>${kit.size} sensors (${kit.sensors.join(", ")})</b> score ROC-AUC ${kit.test_auc.toFixed(4)}, against
+        ${r.full_test_auc.toFixed(4)} with all ${r.steps[0].size}.</p>
+      <div class="insight-chart" id="kit-chart"></div>
+      <p class="chart-caption">Test ROC-AUC against the number of sensors kept. Dashed line: ${r.within} below the full kit.
+        Removed in this order: ${order.join(", ")}.</p>
+      <h3>Remaining-life LSTM on smaller kits</h3>
+      <table class="metrics insight-table kit-table"><thead><tr><th>Sensors</th><th>Kit</th><th>RMSE</th><th>MAE</th></tr></thead>
+        <tbody>${lstmRows}</tbody></table>
+      <p class="muted">The two operating settings stay in every kit: they come from the engine's control system, not from
+        sensors anyone has to buy. Remaining life needs more sensors than the alarm does.</p>`;
+    lineChart($("kit-chart"), {
+      x: steps.map((s) => s.size), y: steps.map((s) => s.test_auc), color: "var(--cobalt)", height: 180,
+      refs: [{ y: r.full_test_auc - r.within, label: `Full kit − ${r.within}`, color: "var(--graphite)" }],
+      hoverX: (x) => `${x} sensors:`, format: (v) => formatValue(v, 3), label: "ROC-AUC against sensors kept",
+    });
+  },
+
+  unfamiliar(body, r) {
+    const f = r.fd003;
+    const rmse = r.lstm_rmse_last_60_cycles;
+    body.innerHTML = `
+      <p>The models learned one way of wearing out, compressor (HPC) wear, from FD001. In HPC wear the sensors move towards
+        their failure levels together. When ${r.pattern_sensors} or more sensors disagree with that pattern at once and keep
+        doing so, the engine is wearing out in a way the models have never seen, and its remaining-life prediction is
+        marked as not reliable.</p>
+      <p class="muted">Calibrated on FD001 alone, then tested on NASA's FD003 fleet, which also has fan wear.</p>
+      <table class="metrics insight-table"><thead><tr><th>Engines</th><th>Count</th><th>Flagged as unfamiliar</th></tr></thead>
+        <tbody>
+          <tr><td>FD003, fan wear (never seen in training)</td><td>${f.fan_wear}</td><td>${f.fan_flagged} of ${f.fan_wear}</td></tr>
+          <tr><td>FD003, compressor wear (familiar)</td><td>${f.hpc_wear}</td><td>${f.hpc_flagged} of ${f.hpc_wear}</td></tr>
+          <tr><td>FD001 test engines</td><td>100</td><td>${r.fd001_false_flags.test_engines}</td></tr>
+          <tr><td>FD001 training engines</td><td>100</td><td>${r.fd001_false_flags.training_engines}</td></tr>
+        </tbody></table>
+      <p>Fan-wear engines were flagged with a median of <b>${Math.round(f.median_life_left_when_flagged)} cycles</b> of life
+        left. The warning matters: over the last 60 cycles the LSTM is off by ${rmse["fan wear"].toFixed(0)} cycles (RMSE) on
+        fan wear, against ${rmse["HPC wear"].toFixed(1)} on the compressor wear it was trained for.</p>
+      ${f.fan_first_blamed_on_a_sensor ? `<p class="muted">In ${f.fan_first_blamed_on_a_sensor} of the ${f.fan_wear} fan-wear
+        engines one sensor started disagreeing before a second joined it, so for a median of
+        ${Math.round(f.fan_blamed_cycles_median)} cycles it was reported as a sensor fault first. Every sensor-fault
+        message warns that this can happen.</p>` : ""}
+      <p class="muted">Try it live: open the simulated engine and press Inject unfamiliar fault.</p>`;
+  },
+
+  adaptation(body, r) {
+    const row = (name, m, labels) => `<tr><td>${name}</td><td>${m.rmse.toFixed(1)}</td>
+      <td>${m.xgb_roc_auc != null ? m.xgb_roc_auc.toFixed(3) : "–"}</td>
+      <td>${m.xgb_recall != null ? share(m.xgb_recall) : "–"}</td><td>${labels}</td></tr>`;
+    body.innerHTML = `
+      <p>A new site or engine type has no failures yet, so no model can be trained on it. ${r.new_fleet} flies in
+        ${r.conditions} flight conditions, and its raw readings jump with the condition far more than with wear, so the
+        FD001 models see nonsense. The adaptation uses only what a new fleet has on day one, its normal running: the first
+        ${r.healthy_cycles_used} cycles of each engine set what healthy looks like in each flight condition, and every reading
+        is translated into FD001's terms. The FD001 models themselves are unchanged.</p>
+      <table class="metrics insight-table"><thead><tr><th>${r.new_fleet}, ${r.test_engines} test engines</th><th>LSTM RMSE</th>
+        <th>XGBoost ROC-AUC</th><th>XGBoost recall</th><th>${r.new_fleet} failure labels</th></tr></thead>
+        <tbody>
+          ${row("FD001 models, raw readings", r.raw, "none")}
+          ${row("FD001 models, translated readings", r.translated, "none")}
+          ${row(`LSTM trained on ${r.new_fleet}`, r.supervised, "all")}
+        </tbody></table>
+      <p class="muted">RMSE is in cycles at each test engine's last recorded cycle. On its own fleet the FD001 LSTM scores
+        ${r.fd001_rmse.toFixed(1)}. The translation closes most of the gap to a model trained on a full failure history,
+        without waiting for a single failure.</p>`;
+  },
+};
+
+function renderInsights() {
+  const tabs = $("insights-tabs");
+  tabs.innerHTML = INSIGHT_TABS.map(([name, label]) => `<button role="tab" type="button" data-insight="${name}"
+    aria-selected="${name === insightTab}">${label}</button>`).join("");
+  for (const b of tabs.querySelectorAll("[data-insight]")) {
+    b.addEventListener("click", () => { insightTab = b.dataset.insight; renderInsights(); });
+  }
+  const body = $("insights-body");
+  const data = state.insights[insightTab];
+  if (data) INSIGHT_VIEWS[insightTab](body, data);
+  else body.innerHTML = `<p class="muted">This analysis has not been run on this machine yet. In the project folder, run
+    <code>${state.insightCommands?.[insightTab] ?? ""}</code>, then open this window again.</p>`;
+  for (const a of body.querySelectorAll("[data-insight-engine]")) {
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      $("insights-dialog").close();
+      selectEngine(Number(a.dataset.insightEngine));
+    });
+  }
+}
+
+$("open-insights").addEventListener("click", async () => {
+  await loadInsights();
+  $("insights-dialog").showModal();
+  renderInsights();
+});
+
 // ------------------------------------------------------------ live sync ----
 
 function setSync(kind, text) {
@@ -1227,6 +2165,7 @@ async function loadAll({ keepSelection = false } = {}) {
   }
   await loadFleet();
   state.simRanges = await api("/api/sim/ranges");
+  await loadInsights();
   await refreshAlerts({ announce: false });
   syncAlertRule();
 

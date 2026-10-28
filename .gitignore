@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.ipynb_checkpoints/
+
+# Trained artefacts are large and fully reproducible by running the training
+# script, so they stay out of git. The dataset itself IS committed so the repo
+# clones and runs with no extra downloads.
+models/*.pkl
+models/*.joblib
+models/*.keras
+models/*.h5
+models/*.json
+models/insights/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local working notes and this file itself stay out of the repo
+claude.md
+CLAUDE.md
+recent-plan.md
+
+# Thesis, papers, presentations, and documents
+*.pdf
+*.pptx
+*.ppt
+*.docx
+*.doc
+paperwork/
+thesis/
+D:/mew-scratch/

@@ -63,31 +63,17 @@ class SensorSpec:
     module: str
 
 
-# Table 2 of Saxena et al., PHM 2008. `module` is where the measurement is
-# taken on the engine, which is what places the sensor on the 3D model.
-SENSOR_SPECS: tuple[SensorSpec, ...] = (
-    SensorSpec("sensor_1", "T2", "Total temperature at fan inlet", "°R", "inlet"),
-    SensorSpec("sensor_2", "T24", "Total temperature at LPC outlet", "°R", "lpc"),
-    SensorSpec("sensor_3", "T30", "Total temperature at HPC outlet", "°R", "hpc"),
-    SensorSpec("sensor_4", "T50", "Total temperature at LPT outlet", "°R", "lpt"),
-    SensorSpec("sensor_5", "P2", "Pressure at fan inlet", "psia", "inlet"),
-    SensorSpec("sensor_6", "P15", "Total pressure in bypass duct", "psia", "bypass"),
-    SensorSpec("sensor_7", "P30", "Total pressure at HPC outlet", "psia", "hpc"),
-    SensorSpec("sensor_8", "Nf", "Physical fan speed", "rpm", "fan"),
-    SensorSpec("sensor_9", "Nc", "Physical core speed", "rpm", "core_shaft"),
-    SensorSpec("sensor_10", "epr", "Engine pressure ratio (P50/P2)", "–", "nozzle"),
-    SensorSpec("sensor_11", "Ps30", "Static pressure at HPC outlet", "psia", "hpc"),
-    SensorSpec("sensor_12", "phi", "Ratio of fuel flow to Ps30", "pps/psi", "combustor"),
-    SensorSpec("sensor_13", "NRf", "Corrected fan speed", "rpm", "fan"),
-    SensorSpec("sensor_14", "NRc", "Corrected core speed", "rpm", "core_shaft"),
-    SensorSpec("sensor_15", "BPR", "Bypass ratio", "–", "bypass"),
-    SensorSpec("sensor_16", "farB", "Burner fuel-air ratio", "–", "combustor"),
-    SensorSpec("sensor_17", "htBleed", "Bleed enthalpy", "–", "hpc"),
-    SensorSpec("sensor_18", "Nf_dmd", "Demanded fan speed", "rpm", "fan"),
-    SensorSpec("sensor_19", "PCNfR_dmd", "Demanded corrected fan speed", "rpm", "fan"),
-    SensorSpec("sensor_20", "W31", "HPT coolant bleed", "lbm/s", "hpt"),
-    SensorSpec("sensor_21", "W32", "LPT coolant bleed", "lbm/s", "lpt"),
-)
+# Table 2 of Saxena et al., PHM 2008, kept in the turbofan machine profile
+# (machines/turbofan/profile.json). `module` is the component the sensor
+# measures, which is what places it on the 3D model and tells Bob where to look.
+def _specs_from_profile() -> tuple[SensorSpec, ...]:
+    from src.profiles import DEFAULT_MACHINE, load_profile
+    prof = load_profile(DEFAULT_MACHINE)
+    return tuple(SensorSpec(s["id"], s["label"], s["description"], s["unit"], s["component_id"])
+                 for s in prof.sensors)
+
+
+SENSOR_SPECS: tuple[SensorSpec, ...] = _specs_from_profile()
 
 SPEC_BY_COLUMN = {spec.column: spec for spec in SENSOR_SPECS}
 

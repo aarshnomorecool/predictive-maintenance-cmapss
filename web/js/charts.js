@@ -40,12 +40,14 @@ export function formatValue(v, digits) {
  *   bands: [{ from, to, color }]       horizontal shaded bands (y ranges)
  *   spans: [{ from, to, color, label }] vertical shaded spans (x ranges)
  *   extra: [{ y, color, dash, label }] further series on the same axes
+ *   area: { lo, hi, color }            shaded range between two per-x series
  *   marker: number                     index of the current cycle
  *   format: (v) => string              value formatter for the hover readout
+ *   hoverX: (x) => string              hover readout prefix (default "Cycle x:")
  *   height: number
  */
 export function lineChart(container, options) {
-  const { x, y, color = "#1f5fad", refs = [], bands = [], spans = [], extra = [],
+  const { x, y, color = "#1f5fad", refs = [], bands = [], spans = [], extra = [], area = null,
           marker, format = (v) => formatValue(v), height = 168 } = options;
   container.replaceChildren();
   const width = Math.max(container.clientWidth, 240);
@@ -71,6 +73,11 @@ export function lineChart(container, options) {
   for (const b of bands) {
     const top = sy(clampY(b.to)), bottom = sy(clampY(b.from));
     el("rect", { x: m.left, y: top, width: w, height: Math.max(0, bottom - top), fill: b.color, class: "chart-band" }, svg);
+  }
+  if (area) {
+    const pts = (vals) => x.map((xv, i) => `${sx(xv).toFixed(1)},${sy(clampY(vals[i])).toFixed(1)}`);
+    const d = `M${pts(area.hi).join("L")}L${pts(area.lo).reverse().join("L")}Z`;
+    el("path", { d, fill: area.color, class: "chart-area" }, svg);
   }
   for (const s of spans) {
     el("rect", { x: sx(s.from), y: m.top, width: Math.max(0, sx(s.to) - sx(s.from)), height: h, fill: s.color, class: "chart-span" }, svg);
@@ -120,7 +127,8 @@ export function lineChart(container, options) {
       const hx = sx(x[i]);
       hLine.setAttribute("x1", hx); hLine.setAttribute("x2", hx);
       hDot.setAttribute("cx", hx); hDot.setAttribute("cy", sy(clampY(y[i])));
-      hText.textContent = `Cycle ${x[i]}: ${options.seriesLabel ? options.seriesLabel + " " : ""}${format(y[i])}`
+      hText.textContent = `${options.hoverX ? options.hoverX(x[i]) : `Cycle ${x[i]}:`} `
+        + `${options.seriesLabel ? options.seriesLabel + " " : ""}${format(y[i])}`
         + extra.map((s) => `, ${s.label} ${format(s.y[i])}`).join("");
       const right = hx > m.left + w * 0.6;
       hText.setAttribute("x", right ? hx - 8 : hx + 8);

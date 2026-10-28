@@ -31,6 +31,7 @@
         <input type="range" id="threshold" min="0.05" max="0.95" step="0.01" value="0.5" aria-describedby="threshold-hint">
         <output id="threshold-value">0.50</output>
       </label>
+      <button class="ghost bob-topbar-btn" id="open-bob" type="button" title="Bob the mechanic — Grounded work orders & AI technician chat"><span class="bob-btn-icon">🛠️</span> <span>Ask Bob</span></button>
       <button class="ghost" id="open-alerts" type="button">Alerts<span class="badge" id="alert-badge" hidden>0</span></button>
       <button class="ghost" id="open-report" type="button">Model report</button>
       <span class="sync" id="sync" aria-live="polite"><span class="sync-dot"></span><span id="sync-text">Connecting</span></span>
@@ -39,10 +40,11 @@
 
   <div class="banner" id="banner" hidden></div>
 
-  <main class="layout">
-    <aside class="fleet" aria-label="Fleet">
+  <main class="layout" id="main-layout">
+    <aside class="fleet" id="fleet-aside" aria-label="Fleet">
       <dl class="fleet-kpis" id="fleet-kpis"></dl>
       <p class="threshold-hint" id="threshold-hint"></p>
+      <button class="ghost insights-open" id="open-insights" type="button">Fleet insights<span>What the analyses found, and what to do next</span></button>
       <div class="fleet-tools">
         <input type="search" id="fleet-search" placeholder="Engine no." aria-label="Find engine number">
         <select id="fleet-sort" aria-label="Sort engines">
@@ -56,11 +58,18 @@
 
     <section class="viewer" aria-label="Engine model">
       <div class="viewer-head">
-        <div>
-          <h2 id="engine-title">Engine</h2>
-          <p class="viewer-sub" id="engine-sub"></p>
+        <div class="viewer-head-group">
+          <button class="ghost small toggle-btn" id="toggle-fleet" type="button" title="Toggle Fleet sidebar">◀ Fleet</button>
+          <div>
+            <h2 id="engine-title">Engine</h2>
+            <p class="viewer-sub" id="engine-sub"></p>
+          </div>
         </div>
-        <div class="gauge" id="gauge" aria-live="polite"></div>
+        <div class="viewer-head-group">
+          <button class="ghost small" id="open-bob-mini" type="button" title="Ask Bob about this engine">🛠️ Ask Bob</button>
+          <div class="gauge" id="gauge" aria-live="polite"></div>
+          <button class="ghost small toggle-btn" id="toggle-detail" type="button" title="Toggle Details panel">Details ▶</button>
+        </div>
       </div>
 
       <div class="view-tabs" role="tablist" aria-label="View">
@@ -82,8 +91,9 @@
           <li><i style="--c:var(--crit)"></i>Near failure level</li>
           <li><i style="--c:var(--low)"></i>Too little signal</li>
           <li><i class="hollow" style="--c:var(--unmon)"></i>Not used by models</li>
+          <li><i style="--c:var(--suspect)"></i>Suspected sensor fault</li>
         </ul>
-        <p class="stage-note">Illustrative geometry. Sensor positions follow the C-MAPSS station map; colours are computed from the engine's recorded data.</p>
+        <p class="stage-note">Reference model. Sensor positions follow the C-MAPSS station map; colours are computed from the engine's recorded data.</p>
       </div>
 
       <div class="stage alt-stage" id="space-stage" hidden>
@@ -135,6 +145,9 @@
           <div class="sim-group"><span class="sim-label" id="sim-wear-label">Wear</span>
             <div class="segmented small" id="sim-wear" role="radiogroup" aria-labelledby="sim-wear-label"></div></div>
           <button class="ghost small" id="sim-fault" type="button" aria-pressed="false">Inject HPC fault</button>
+          <button class="ghost small" id="sim-fan" type="button" aria-pressed="false"
+            title="Fan wear: a failure type the models were never trained on">Inject unfamiliar fault</button>
+          <button class="ghost small" id="sim-break" type="button" aria-pressed="false">Break a sensor</button>
           <button class="ghost small" id="sim-reset" type="button">New engine</button>
           <button class="sim-demo" id="sim-demo" type="button">Run demo</button>
         </div>
@@ -165,7 +178,39 @@
     <div id="alerts-body"></div>
   </dialog>
 
+  <dialog id="insights-dialog" class="wide">
+    <form method="dialog" class="report-head">
+      <h2>Fleet insights</h2>
+      <button class="ghost small" value="close">Close</button>
+    </form>
+    <div class="insight-tabs" role="tablist" id="insights-tabs" aria-label="Analysis"></div>
+    <div id="insights-body" role="tabpanel"></div>
+  </dialog>
+
+  <dialog id="bob-dialog" class="wide">
+    <form method="dialog" class="report-head">
+      <div>
+        <h2>Bob the mechanic</h2>
+        <p class="viewer-sub" style="margin:2px 0 0">Grounded maintenance guidance · Bob explains, the models decide</p>
+      </div>
+      <div class="bob-header-actions">
+        <label class="bob-provider-ctrl">
+          <span>Provider:</span>
+          <select id="bob-provider-select" aria-label="Provider">
+            <option value="template">Template (deterministic)</option>
+            <option value="nvidia">NVIDIA Cloud AI</option>
+            <option value="ollama">Local Ollama</option>
+          </select>
+        </label>
+        <button class="ghost small" id="bob-print-btn" type="button">Print work order</button>
+        <button class="ghost small" id="bob-close-btn" type="button" aria-label="Close Bob modal">✕ Close</button>
+      </div>
+    </form>
+    <div id="bob-body"></div>
+  </dialog>
+
   <div class="toast" id="toast" role="status" hidden></div>
+
 
   <script type="module" src="js/main.js"></script>
 </body>

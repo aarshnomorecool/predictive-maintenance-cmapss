@@ -159,6 +159,14 @@ def compose(kind: str, engine_label: str, cycle: int, risk: float | None, model:
     elif kind == "recovered":
         subject = f"[Back to normal] {engine_label}"
         lead = f"{engine_label} is back below the alert level."
+    elif kind == "unfamiliar":
+        subject = f"[Unfamiliar wear] {engine_label}: do not trust the remaining-life estimate"
+        lead = f"{engine_label} is wearing out in a pattern the models were never trained on."
+    elif kind == "sensor_fault":
+        sensor = drivers[0]["symbol"] if drivers else "A sensor"
+        subject = f"[Sensor fault] {engine_label}: {sensor} reading is unreliable"
+        lead = f"A sensor on {engine_label} looks faulty. Check the instrument, not the engine."
+        drivers = []
     else:
         subject = "[Test] Turbofan health monitor email alerts work"
         lead = "This is a test message. Email alerts are set up correctly."
@@ -180,7 +188,8 @@ def compose(kind: str, engine_label: str, cycle: int, risk: float | None, model:
         "Sent by the Turbofan Health Monitor (NASA C-MAPSS predictive maintenance project).",
     ]).replace("\n\n\n", "\n\n")
 
-    colour = {"alert": "#d7263d", "recovered": "#1e9e5a"}.get(kind, "#1f5fad")
+    colour = {"alert": "#d7263d", "recovered": "#1e9e5a", "sensor_fault": "#b4237a",
+              "unfamiliar": "#e08a00"}.get(kind, "#1f5fad")
     rows = "".join(
         f"<tr><td style='padding:4px 12px 4px 0;color:#5b6873'>{k}</td><td style='padding:4px 0'><b>{v}</b></td></tr>"
         for k, v in (("Cycle", cycle if cycle else None),
@@ -213,6 +222,8 @@ class AlertManager:
         self.lock = threading.Lock()
         self.log: deque[dict] = deque(self._read_log(), maxlen=LOG_LIMIT)
         self.status: dict[str, str] = {}            # engine key -> normal | alert
+        self.sensor_faults: dict[str, set] = {}     # engine key -> sensors already reported
+        self.unfamiliar_reported: set = set()       # engines already reported as unfamiliar
         self.risk_window: dict[str, deque] = {}
         self.threshold = 0.5
         self.model = "XGBoost"
@@ -246,6 +257,43 @@ class AlertManager:
         with self.lock:
             self.status.pop(key, None)
             self.risk_window.pop(key, None)
+            self.sensor_faults.pop(key, None)
+            self.unfamiliar_reported.discard(key)
+
+    def check_unfamiliar(self, key: str, label: str, cycle: int, unfamiliar: bool, sensors: int,
+                         risk: float | None, predicted_rul: float | None, link: str) -> dict | None:
+        """Report an unfamiliar wear pattern once per engine."""
+        with self.lock:
+            if not unfamiliar or key in self.unfamiliar_reported:
+                return None
+            self.unfamiliar_reported.add(key)
+            model = self.model
+        reason = (f"{sensors} cross-checked sensors are moving in a way none of the training engines did. "
+                  f"The models learned compressor wear only, so their remaining-life estimate is not "
+                  f"reliable for this engine. Inspect it.")
+        return self._record("unfamiliar", label, cycle, risk, model, predicted_rul, [], reason, link)
+
+    def check_sensors(self, key: str, label: str, cycle: int, faulty: list[dict],
+                      risk: float | None, predicted_rul: float | None, link: str) -> list[dict]:
+        """Report each newly flagged sensor once; forget it when it clears, so a
+        sensor that breaks again is reported again."""
+        with self.lock:
+            known = self.sensor_faults.setdefault(key, set())
+            now = {f["column"] for f in faulty}
+            known &= now
+            fresh = [f for f in faulty if f["column"] not in known]
+            known |= {f["column"] for f in fresh}
+            model = self.model
+        entries = []
+        for f in fresh:
+            reason = (f"{f['symbol']} ({f['description']}) reads {f['sensor_drift']:.0%} of the way to failure, "
+                      f"but the other {f['peers']} cross-checked sensors agree on {f['consensus']:.0%}. "
+                      f"That pattern points to a faulty sensor, not engine wear. Predictions now use a value "
+                      f"rebuilt from the other sensors. If a second sensor starts disagreeing too, the engine is "
+                      f"reported as an unfamiliar wear pattern instead, so check the sensor before replacing it.")
+            entries.append(self._record("sensor_fault", label, cycle, risk, model, predicted_rul,
+                                        [f], reason, link))
+        return entries
 
     def entries(self) -> list[dict]:
         with self.lock:
@@ -255,8 +303,14 @@ class AlertManager:
         with self.lock:
             return self.log[-1]["id"] if self.log else 0
 
+    def acknowledge(self, key: str) -> None:
+        """An inspection answered the alert: back to normal, so it can fire again."""
+        with self.lock:
+            self.status[key] = "normal"
+
     def evaluate(self, key: str, label: str, cycle: int, probability: float,
-                 predicted_rul: float | None, drivers_fn, link: str) -> dict | None:
+                 predicted_rul: float | None, drivers_fn, link: str,
+                 threshold: float | None = None) -> dict | None:
         """Feed one cycle. Returns the new log entry if an alert or recovery fired.
 
         ``drivers_fn`` is only called when something fires, because SHAP
@@ -267,7 +321,8 @@ class AlertManager:
             window.append(probability)
             risk = sum(window) / len(window)
             state = self.status.get(key, "normal")
-            risk_hit = risk >= self.threshold
+            level = self.threshold if threshold is None else threshold
+            risk_hit = risk >= level
             rul_hit = predicted_rul is not None and predicted_rul <= RUL_ALERT
 
             kind = reason = None
@@ -275,12 +330,12 @@ class AlertManager:
                 kind = "alert"
                 reasons = []
                 if risk_hit:
-                    reasons.append(f"average failure risk {risk:.0%} reached the {self.threshold:.0%} alert level")
+                    reasons.append(f"average failure risk {risk:.0%} reached the {level:.0%} alert level")
                 if rul_hit:
                     reasons.append(f"the LSTM predicts only {predicted_rul:.0f} cycles left")
                 reason = " and ".join(reasons)
                 reason = reason[0].upper() + reason[1:] + "."
-            elif (state == "alert" and risk < self.threshold - RECOVERY_MARGIN
+            elif (state == "alert" and risk < level - RECOVERY_MARGIN
                   and (predicted_rul is None or predicted_rul > RUL_RECOVERY)):
                 kind = "recovered"
                 reason = (f"Average risk fell to {risk:.0%} and predicted life rose to "

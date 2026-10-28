@@ -1,0 +1,486 @@
+{
+ "id": "turbofan",
+ "name": "Turbofan engine (NASA C-MAPSS FD001)",
+ "machine_type": "turbofan engine",
+ "dataset_name": "NASA C-MAPSS FD001",
+ "unit_label": "engine",
+ "time_unit": "cycle",
+ "note": "Component names are inferred from where each sensor measures (Saxena et al., Table 2); the dataset does not name components. Checklists are general inspection steps written for this project, not a manufacturer's maintenance manual.",
+ "columns": {
+  "unit": "unit",
+  "time": "cycle",
+  "label": "failure_soon",
+  "mode": null,
+  "settings": [
+   "setting_1",
+   "setting_2",
+   "setting_3"
+  ],
+  "sensors": [
+   "sensor_1",
+   "sensor_2",
+   "sensor_3",
+   "sensor_4",
+   "sensor_5",
+   "sensor_6",
+   "sensor_7",
+   "sensor_8",
+   "sensor_9",
+   "sensor_10",
+   "sensor_11",
+   "sensor_12",
+   "sensor_13",
+   "sensor_14",
+   "sensor_15",
+   "sensor_16",
+   "sensor_17",
+   "sensor_18",
+   "sensor_19",
+   "sensor_20",
+   "sensor_21"
+  ]
+ },
+ "sensors": [
+  {
+   "id": "sensor_1",
+   "label": "T2",
+   "description": "Total temperature at fan inlet",
+   "unit": "°R",
+   "component_id": "inlet",
+   "baseline_mean": 518.67,
+   "baseline_std": 0.0,
+   "drift_direction": "flat"
+  },
+  {
+   "id": "sensor_2",
+   "label": "T24",
+   "description": "Total temperature at LPC outlet",
+   "unit": "°R",
+   "component_id": "lpc",
+   "baseline_mean": 642.39934,
+   "baseline_std": 0.374046,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_3",
+   "label": "T30",
+   "description": "Total temperature at HPC outlet",
+   "unit": "°R",
+   "component_id": "hpc",
+   "baseline_mean": 1587.188904,
+   "baseline_std": 4.657661,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_4",
+   "label": "T50",
+   "description": "Total temperature at LPT outlet",
+   "unit": "°R",
+   "component_id": "lpt",
+   "baseline_mean": 1403.174388,
+   "baseline_std": 5.8988,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_5",
+   "label": "P2",
+   "description": "Pressure at fan inlet",
+   "unit": "psia",
+   "component_id": "inlet",
+   "baseline_mean": 14.62,
+   "baseline_std": 0.0,
+   "drift_direction": "flat"
+  },
+  {
+   "id": "sensor_6",
+   "label": "P15",
+   "description": "Total pressure in bypass duct",
+   "unit": "psia",
+   "component_id": "bypass",
+   "baseline_mean": 21.609605,
+   "baseline_std": 0.001947,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_7",
+   "label": "P30",
+   "description": "Total pressure at HPC outlet",
+   "unit": "psia",
+   "component_id": "hpc",
+   "baseline_mean": 553.916972,
+   "baseline_std": 0.615409,
+   "drift_direction": "down"
+  },
+  {
+   "id": "sensor_8",
+   "label": "Nf",
+   "description": "Physical fan speed",
+   "unit": "rpm",
+   "component_id": "fan",
+   "baseline_mean": 2388.059429,
+   "baseline_std": 0.053784,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_9",
+   "label": "Nc",
+   "description": "Physical core speed",
+   "unit": "rpm",
+   "component_id": "core_shaft",
+   "baseline_mean": 9057.329743,
+   "baseline_std": 8.433067,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_10",
+   "label": "epr",
+   "description": "Engine pressure ratio (P50/P2)",
+   "unit": "–",
+   "component_id": "nozzle",
+   "baseline_mean": 1.3,
+   "baseline_std": 0.0,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_11",
+   "label": "Ps30",
+   "description": "Static pressure at HPC outlet",
+   "unit": "psia",
+   "component_id": "hpc",
+   "baseline_mean": 47.366126,
+   "baseline_std": 0.172873,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_12",
+   "label": "phi",
+   "description": "Ratio of fuel flow to Ps30",
+   "unit": "pps/psi",
+   "component_id": "combustor",
+   "baseline_mean": 521.878737,
+   "baseline_std": 0.496888,
+   "drift_direction": "down"
+  },
+  {
+   "id": "sensor_13",
+   "label": "NRf",
+   "description": "Corrected fan speed",
+   "unit": "rpm",
+   "component_id": "fan",
+   "baseline_mean": 2388.058429,
+   "baseline_std": 0.054325,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_14",
+   "label": "NRc",
+   "description": "Corrected core speed",
+   "unit": "rpm",
+   "component_id": "core_shaft",
+   "baseline_mean": 8138.411403,
+   "baseline_std": 7.95183,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_15",
+   "label": "BPR",
+   "description": "Bypass ratio",
+   "unit": "–",
+   "component_id": "bypass",
+   "baseline_mean": 8.419611,
+   "baseline_std": 0.026282,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_16",
+   "label": "farB",
+   "description": "Burner fuel-air ratio",
+   "unit": "–",
+   "component_id": "combustor",
+   "baseline_mean": 0.03,
+   "baseline_std": 0.0,
+   "drift_direction": "flat"
+  },
+  {
+   "id": "sensor_17",
+   "label": "htBleed",
+   "description": "Bleed enthalpy",
+   "unit": "–",
+   "component_id": "hpc",
+   "baseline_mean": 392.327512,
+   "baseline_std": 1.138331,
+   "drift_direction": "up"
+  },
+  {
+   "id": "sensor_18",
+   "label": "Nf_dmd",
+   "description": "Demanded fan speed",
+   "unit": "rpm",
+   "component_id": "fan",
+   "baseline_mean": 2388.0,
+   "baseline_std": 0.0,
+   "drift_direction": "flat"
+  },
+  {
+   "id": "sensor_19",
+   "label": "PCNfR_dmd",
+   "description": "Demanded corrected fan speed",
+   "unit": "rpm",
+   "component_id": "fan",
+   "baseline_mean": 100.0,
+   "baseline_std": 0.0,
+   "drift_direction": "flat"
+  },
+  {
+   "id": "sensor_20",
+   "label": "W31",
+   "description": "HPT coolant bleed",
+   "unit": "lbm/s",
+   "component_id": "hpt",
+   "baseline_mean": 38.923648,
+   "baseline_std": 0.129596,
+   "drift_direction": "down"
+  },
+  {
+   "id": "sensor_21",
+   "label": "W32",
+   "description": "LPT coolant bleed",
+   "unit": "lbm/s",
+   "component_id": "lpt",
+   "baseline_mean": 23.354331,
+   "baseline_std": 0.078253,
+   "drift_direction": "down"
+  }
+ ],
+ "components": [
+  {
+   "id": "inlet",
+   "name": "Engine inlet",
+   "layout": {
+    "x": 0.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "inlet.1",
+     "text": "Inspect the inlet for damage, ice or debris"
+    },
+    {
+     "id": "inlet.2",
+     "text": "Check the inlet temperature and pressure probes"
+    }
+   ]
+  },
+  {
+   "id": "fan",
+   "name": "Fan",
+   "layout": {
+    "x": 1.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "fan.1",
+     "text": "Inspect fan blades for foreign-object damage, nicks and leading-edge erosion"
+    },
+    {
+     "id": "fan.2",
+     "text": "Check fan blade tip clearance and the abradable rub strip"
+    },
+    {
+     "id": "fan.3",
+     "text": "Review the fan vibration trend for imbalance"
+    }
+   ]
+  },
+  {
+   "id": "lpc",
+   "name": "Low-pressure compressor (LPC)",
+   "layout": {
+    "x": 3.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "lpc.1",
+     "text": "Borescope the LPC (booster) stages for blade erosion and deposits"
+    },
+    {
+     "id": "lpc.2",
+     "text": "Check the variable bleed valves for correct operation"
+    }
+   ]
+  },
+  {
+   "id": "hpc",
+   "name": "High-pressure compressor (HPC)",
+   "layout": {
+    "x": 4.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "hpc.1",
+     "text": "Borescope the HPC stages for blade tip erosion, rub and fouling"
+    },
+    {
+     "id": "hpc.2",
+     "text": "Check the variable stator vane actuation and rigging"
+    },
+    {
+     "id": "hpc.3",
+     "text": "Review the compressor wash history and schedule a wash if fouling is suspected"
+    },
+    {
+     "id": "hpc.4",
+     "text": "Compare HPC outlet pressure and temperature with the last performance check"
+    }
+   ]
+  },
+  {
+   "id": "combustor",
+   "name": "Combustor",
+   "layout": {
+    "x": 5.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "combustor.1",
+     "text": "Borescope the combustor liner for cracks, burn-through and hot spots"
+    },
+    {
+     "id": "combustor.2",
+     "text": "Inspect the fuel nozzles for coking and an uneven spray pattern"
+    },
+    {
+     "id": "combustor.3",
+     "text": "Check fuel flow against the expected schedule for the power setting"
+    }
+   ]
+  },
+  {
+   "id": "hpt",
+   "name": "High-pressure turbine (HPT)",
+   "layout": {
+    "x": 6.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "hpt.1",
+     "text": "Borescope HPT blades and nozzle guide vanes for thermal distress and coating loss"
+    },
+    {
+     "id": "hpt.2",
+     "text": "Check the HPT cooling-air (coolant bleed) supply"
+    }
+   ]
+  },
+  {
+   "id": "lpt",
+   "name": "Low-pressure turbine (LPT)",
+   "layout": {
+    "x": 8.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "lpt.1",
+     "text": "Borescope LPT blades for cracks and tip curl"
+    },
+    {
+     "id": "lpt.2",
+     "text": "Review the exhaust gas temperature margin trend"
+    },
+    {
+     "id": "lpt.3",
+     "text": "Check the LPT cooling-air (coolant bleed) supply"
+    }
+   ]
+  },
+  {
+   "id": "bypass",
+   "name": "Bypass duct",
+   "layout": {
+    "x": 2.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "bypass.1",
+     "text": "Inspect the bypass duct for leaks and damage"
+    },
+    {
+     "id": "bypass.2",
+     "text": "Check the bypass pressure sensing lines"
+    }
+   ]
+  },
+  {
+   "id": "core_shaft",
+   "name": "Core shaft and bearings",
+   "layout": {
+    "x": 7.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "core_shaft.1",
+     "text": "Review core and fan shaft speed trends for rubs or bearing distress"
+    },
+    {
+     "id": "core_shaft.2",
+     "text": "Inspect the oil system: chip detectors, filter and oil consumption"
+    }
+   ]
+  },
+  {
+   "id": "nozzle",
+   "name": "Exhaust nozzle",
+   "layout": {
+    "x": 9.0,
+    "y": 0,
+    "z": 0,
+    "size": 1.0
+   },
+   "checklist": [
+    {
+     "id": "nozzle.1",
+     "text": "Inspect the exhaust nozzle for cracks and distortion"
+    }
+   ]
+  }
+ ],
+ "labelling": {
+  "rul_clip": 125,
+  "failure_window": 30
+ },
+ "tasks_enabled": {
+  "classification": true,
+  "rul": true,
+  "fault_mode": false
+ },
+ "models": {
+  "dir": "models",
+  "relative_to": "project"
+ }
+}

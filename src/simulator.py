@@ -73,9 +73,11 @@ class Profile:
     failure: dict[str, float]
     within_std: dict[str, float]      # noise inside one engine, healthy phase
     between_std: dict[str, float]     # spread of healthy level across engines
+    unit_offsets: np.ndarray          # each training engine's healthy level minus the fleet's
     low: dict[str, float]             # observed range, for manual overrides
     high: dict[str, float]
     end_damage: float                 # damage at the final recorded cycle
+    fan_coeff: dict[str, float] = field(default_factory=dict)   # fan-wear shift at "damage 1" (FD003)
 
     def damage_coeff(self, column: str) -> float:
         return self.failure[column] - self.healthy[column]
@@ -89,7 +91,8 @@ def measure_profile(feature_cols: list[str], subset: str = config.SUBSET) -> Pro
     end = train[train[config.RUL_COL] == 0]
 
     within = healthy.groupby(config.UNIT_COL)[columns].std().mean()
-    between = healthy.groupby(config.UNIT_COL)[columns].mean().std()
+    unit_means = healthy.groupby(config.UNIT_COL)[columns].mean()
+    between = unit_means.std()
 
     profile = Profile(
         columns=columns,
@@ -97,6 +100,7 @@ def measure_profile(feature_cols: list[str], subset: str = config.SUBSET) -> Pro
         failure=failing[columns].mean().to_dict(),
         within_std=within.fillna(0).to_dict(),
         between_std=between.fillna(0).to_dict(),
+        unit_offsets=(unit_means - unit_means.mean()).fillna(0).to_numpy(),
         low=train[columns].min().to_dict(),
         high=train[columns].max().to_dict(),
         end_damage=1.0,
@@ -111,7 +115,29 @@ def measure_profile(feature_cols: list[str], subset: str = config.SUBSET) -> Pro
     # End of life on the damage scale, averaged over the channels that move
     ratios = [(end[c].mean() - profile.healthy[c]) / profile.damage_coeff(c) for c in moving]
     profile.end_damage = float(np.mean(ratios))
+    profile.fan_coeff = _fan_fingerprint(profile, moving)
     return profile
+
+
+def _fan_fingerprint(profile: Profile, moving: list[str]) -> dict[str, float]:
+    """How every channel shifts under fan degradation, measured on the FD003
+    engines whose end-of-life pattern is far from FD001's (src.unfamiliar_wear).
+    Used only by the "unfamiliar fault" demo; the models never see FD003."""
+    try:
+        fd3 = add_train_rul(load_train("FD003"), clip=10_000)
+    except FileNotFoundError:
+        return {}
+    columns = profile.columns
+    healthy3 = fd3[fd3[config.RUL_COL] >= config.RUL_CLIP].groupby(config.UNIT_COL)[columns].mean()
+    end3 = fd3[fd3[config.RUL_COL] < 10].groupby(config.UNIT_COL)[columns].mean()
+    drift = (end3[moving] - pd.Series(profile.healthy)[moving]) / pd.Series(
+        {c: profile.damage_coeff(c) for c in moving})
+    distance = np.linalg.norm(drift.to_numpy() - 1.0, axis=1)
+    fan_units = drift.index[distance > 6.0]
+    if not len(fan_units):
+        return {}
+    shift = (end3.loc[fan_units] - healthy3.loc[fan_units]).mean()
+    return {c: float(shift[c]) if c in moving else 0.0 for c in columns}
 
 
 def normal_rate(profile: Profile) -> float:
@@ -136,6 +162,8 @@ class EngineState:
     seed: int
     wear: str = "normal"
     fault: bool = False
+    fan_damage: float = 0.0             # unfamiliar fault (fan wear), 0 until injected
+    fan_fault: bool = False
     overrides: dict[str, float] = field(default_factory=dict)
     damage: float = 0.0
     cycle: int = 0
@@ -145,9 +173,24 @@ class EngineState:
     def __post_init__(self):
         self.rng = np.random.default_rng(self.seed)
         self.damage = float(self.rng.uniform(*INITIAL_DAMAGE))
-        # This engine's own manufacturing offset, fixed for its whole life
-        self.offset = {c: float(self.rng.normal(0, self.profile.between_std[c]))
-                       for c in self.profile.columns}
+        # This engine's manufacturing offsets, fixed for its whole life. They are
+        # borrowed together from one real training engine rather than drawn per
+        # sensor: on real engines the offsets are correlated (an engine that runs
+        # warm runs warm on every temperature), and independent draws made
+        # healthy sensors disagree more than real ones ever do.
+        donor = self.profile.unit_offsets[self.rng.integers(len(self.profile.unit_offsets))]
+        self.offset = {c: float(v) for c, v in zip(self.profile.columns, donor)}
+        # Part of a real engine's offset is simply initial wear, which this
+        # simulator already draws as INITIAL_DAMAGE. Remove the donor's
+        # component along the wear direction so it is not counted twice.
+        p = self.profile
+        scale = {c: p.within_std[c] or 1.0 for c in p.columns}
+        g = {c: p.damage_coeff(c) / scale[c] for c in p.columns}
+        o = {c: self.offset[c] / scale[c] for c in p.columns}
+        gg = sum(v * v for v in g.values())
+        if gg > 0:
+            alpha = sum(o[c] * g[c] for c in p.columns) / gg
+            self.offset = {c: self.offset[c] - alpha * p.damage_coeff(c) for c in p.columns}
         self.base_rate = normal_rate(self.profile)
 
     @property
@@ -156,16 +199,23 @@ class EngineState:
 
     @property
     def failed(self) -> bool:
-        return self.damage >= self.profile.end_damage
+        return self.damage >= self.profile.end_damage or self.fan_damage >= self.profile.end_damage
 
     def projected_life(self) -> float:
-        return cycles_to_end(self.damage, self.rate, self.profile)
+        life = cycles_to_end(self.damage, self.rate, self.profile)
+        if self.fan_fault:
+            life = min(life, cycles_to_end(self.fan_damage, self.base_rate * FAULT_MULTIPLIER, self.profile))
+        return life
 
     def step(self) -> dict:
         """Advance one cycle and return the new raw row."""
         if self.cycle > 0:
             self.damage = min(self.damage + self.rate * (GROWTH_OFFSET + self.damage),
                               self.profile.end_damage)
+            if self.fan_fault:
+                fan_rate = self.base_rate * FAULT_MULTIPLIER
+                self.fan_damage = min(self.fan_damage + fan_rate * (GROWTH_OFFSET + self.fan_damage),
+                                      self.profile.end_damage)
         self.cycle += 1
         p = self.profile
         row = {config.UNIT_COL: 0, config.CYCLE_COL: self.cycle}
@@ -175,7 +225,8 @@ class EngineState:
                 row[c] = self.overrides[c] + noise
             else:
                 row[c] = (p.healthy[c] + self.offset[c]
-                          + self.damage * p.damage_coeff(c) + noise)
+                          + self.damage * p.damage_coeff(c)
+                          + self.fan_damage * p.fan_coeff.get(c, 0.0) + noise)
         row["damage"] = self.damage
         row["projected_life"] = self.projected_life()
         self.rows.append(row)
@@ -201,10 +252,12 @@ def simulate_run(profile: Profile, seed: int, wear: str = "normal",
 class Scorer:
     """Scores the newest cycle with every trained model, one cycle at a time."""
 
-    def __init__(self, artifacts, rul):
+    def __init__(self, artifacts, rul, integrity=None):
         from src.inference import PROBABILITY_COLUMNS
         self.artifacts = artifacts
         self.rul = rul
+        self.integrity = integrity      # sensor integrity guard, optional
+        self.forced: list[str] = []     # sensors a technician marked faulty
         self.prob_cols = PROBABILITY_COLUMNS
         # Single-row prediction is faster without a process pool; copy so the
         # dashboard's batch scoring keeps all cores.
@@ -225,6 +278,26 @@ class Scorer:
                                     input_signature=[spec], reduce_retracing=True)
 
     def score(self, history: pd.DataFrame) -> dict:
+        """Scores for the newest cycle. When the integrity guard flags a sensor,
+        the scores are computed on the repaired readings and the raw ones are
+        kept under "raw", so a broken sensor never drives an alert."""
+        out = self._score(history)
+        out["faulty"] = []
+        if self.integrity is not None:
+            from src.sensor_integrity import assess
+            from src.unfamiliar_wear import pattern_flags
+            res = assess(history, self.integrity, self.forced)
+            out["unfamiliar"] = bool(pattern_flags(res)[1].iloc[-1])
+            faulty = res.faulty_at_last(history[config.UNIT_COL].iloc[-1])
+            if faulty:
+                repaired = self._score(res.corrected)
+                repaired["raw"] = {k: out[k] for k in (*self.prob_cols.values(), "predicted_rul")}
+                repaired["faulty"] = faulty
+                repaired["unfamiliar"] = out["unfamiliar"]
+                return repaired
+        return out
+
+    def _score(self, history: pd.DataFrame) -> dict:
         from src.preprocessing import apply_scaler, make_windows_every_cycle
         last = history.tail(1)
         X = apply_scaler(last, self.artifacts.scaler, self.artifacts.feature_cols)[
@@ -265,11 +338,11 @@ class SimulationRunner:
         self.thread = threading.Thread(target=self._loop, daemon=True, name="simulation")
         self.thread.start()
 
-    def bind(self, artifacts, rul, profile: Profile) -> None:
+    def bind(self, artifacts, rul, profile: Profile, integrity=None) -> None:
         """Attach freshly loaded models. Called on start-up and after retraining."""
         with self.lock:
             had_engine = self.engine is not None
-            self.scorer = Scorer(artifacts, rul)
+            self.scorer = Scorer(artifacts, rul, integrity)
             self.profile = profile
             self.reset()
             if had_engine:
@@ -322,6 +395,15 @@ class SimulationRunner:
                 self.engine.fault = active
                 self.engine.note("HPC fault injected: degradation now 3x faster" if active
                                  else "HPC fault cleared")
+            self.version += 1
+
+    def set_fan_fault(self, active: bool) -> None:
+        with self.lock:
+            if not self.profile.fan_coeff:
+                raise ValueError("FD003 data not found, so the fan-wear fingerprint is unavailable")
+            if active and not self.engine.fan_fault:
+                self.engine.fan_fault = True
+                self.engine.note("Unfamiliar fault injected: fan wear, a failure type the models never saw")
             self.version += 1
 
     def set_override(self, column: str, value: float | None) -> None:
@@ -402,6 +484,9 @@ class SimulationRunner:
             history = pd.DataFrame(e.rows)
             for key in ("prob_rf", "prob_xgb", "predicted_rul"):
                 history[key] = [s.get(key) for s in self.scores]
+                # what the models said before any sensor repair
+                history["raw_" + key] = [s.get("raw", {}).get(key, s.get(key)) for s in self.scores]
+            history["faulty"] = [s.get("faulty", []) for s in self.scores]
             status = {
                 "running": self.running,
                 "speed": self.speed,
@@ -409,6 +494,8 @@ class SimulationRunner:
                 "wear": e.wear,
                 "wear_presets": list(WEAR_PRESETS),
                 "fault": e.fault,
+                "fan_fault": e.fan_fault,
+                "fan_available": bool(self.profile.fan_coeff),
                 "failed": e.failed,
                 "demo": self.demo is not None,
                 "cycle": e.cycle,
@@ -459,6 +546,11 @@ def main() -> None:
           f"lives {lives.min()} to {lives.max()} cycles")
     print(f"\n  LSTM remaining life   RMSE {np.sqrt(np.mean((lstm - truth) ** 2)):6.2f} cycles "
           f"(real test engines: {rul.metadata['metrics']['LSTM']['test']['rmse']:.2f})")
+    setting = sim[config.UNIT_COL].map(
+        {k + 1: "HPC fault" if fault_at else wear for k, (wear, fault_at) in enumerate(plan)}).to_numpy()
+    print("    by setting: " + ", ".join(
+        f"{s} {np.sqrt(np.mean((lstm[setting == s] - truth[setting == s]) ** 2)):.2f}"
+        for s in ("normal", "fast", "HPC fault")))
     for name, col in (("XGBoost", "prob_xgb"), ("Random Forest", "prob_rf")):
         auc = roc_auc_score(failing, scored[col])
         print(f"  {name:<14} failure ROC-AUC {auc:.4f}")

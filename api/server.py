@@ -52,6 +52,11 @@ from src.latent_space import (
 from src.preprocessing import apply_scaler, make_windows_every_cycle
 from src.alerts import AlertManager, EmailSettings
 from src.simulator import SimulationRunner, measure_profile
+from src.sensor_integrity import IntegrityModel, assess, fit_integrity
+from src.trust import likely_range, load_trust
+from src.inspections import InspectionLog, MEMORY_CYCLES
+from src.active_inspection import suggest as suggest_inspections
+from src.maintenance_plan import DEFAULT_HORIZON, SAFETY, plan as repair_plan
 from src.sensor_health import (
     CRITICAL_LEVEL,
     SENSOR_SPECS,
@@ -62,6 +67,12 @@ from src.sensor_health import (
     score_history,
     severity,
 )
+from src.profiles import DEFAULT_MACHINE, MACHINES_DIR, load_profile
+from src.bob.findings import Findings, status_from_rule
+from src.bob.providers import get_provider, list_providers
+from src.bob.workorder import make_work_order, render_html
+from src.unfamiliar_wear import pattern_flags
+
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -91,6 +102,7 @@ class State:
     display_center: np.ndarray | None = None  # PCA coords -> [-1, 1] for drawing
     display_scale: np.ndarray | None = None
     layers: object = None                     # (keras model, layer list) for activations
+    integrity: IntegrityModel | None = None   # sensor integrity guard
 
 
 def combined_signature() -> tuple:
@@ -102,6 +114,43 @@ _state: State | None = None
 _lock = threading.Lock()
 
 alerts = AlertManager()
+
+
+class TechnicianNotes:
+    """Sensors a technician has marked faulty, per engine. Kept on disk so the
+    judgement survives a restart; models/ is gitignored."""
+
+    path = config.MODELS_DIR / "technician_notes.json"
+
+    def __init__(self):
+        import json
+        try:
+            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.data = {}
+        self.lock = threading.Lock()
+
+    def excluded(self, key) -> list[str]:
+        with self.lock:
+            return list(self.data.get(str(key), {}).get("excluded", []))
+
+    def set_excluded(self, key, sensor: str, faulty: bool) -> list[str]:
+        import json
+        from src.artifact_io import atomic_write_text
+        with self.lock:
+            entry = self.data.setdefault(str(key), {})
+            current = set(entry.get("excluded", []))
+            (current.add if faulty else current.discard)(sensor)
+            entry["excluded"] = sorted(current)
+            try:
+                atomic_write_text(self.path, json.dumps(self.data, indent=1))
+            except OSError:
+                pass
+            return entry["excluded"]
+
+
+notes = TechnicianNotes()
+inspections = InspectionLog()
 
 
 def _sim_cycle(runner: SimulationRunner, scores: dict) -> None:
@@ -120,9 +169,38 @@ def _sim_cycle(runner: SimulationRunner, scores: dict) -> None:
                  "reading": round(float(r.reading), 3)}
                 for r in frame.head(3).itertuples()]
 
+    link = EmailSettings.from_env().dashboard_url.rstrip("/") + f"/#engine={SIM_ID}"
+    if _state is not None and _state.integrity is not None:
+        # sensors the technician already marked faulty need no alert
+        detected = [c for c in scores.get("faulty", []) if c not in runner.scorer.forced]
+        alerts.check_sensors(SIM_ID, SIM_LABEL, runner.engine.cycle,
+                             _fault_details(_state, pd.DataFrame(runner.engine.rows), detected),
+                             probability, scores.get("predicted_rul"), link)
+    if scores.get("unfamiliar"):
+        res = assess(pd.DataFrame(runner.engine.rows), _state.integrity) if _state and _state.integrity else None
+        n = int((res.z.abs().iloc[-1] > 8).sum()) if res is not None else 0
+        alerts.check_unfamiliar(SIM_ID, SIM_LABEL, runner.engine.cycle, True, n,
+                                probability, scores.get("predicted_rul"), link)
+    level = inspections.level_at(SIM_ID, runner.engine.cycle, alerts.threshold)
     alerts.evaluate(SIM_ID, SIM_LABEL, runner.engine.cycle, probability,
-                    scores.get("predicted_rul"), drivers,
-                    EmailSettings.from_env().dashboard_url.rstrip("/") + f"/#engine={SIM_ID}")
+                    scores.get("predicted_rul"), drivers, link, threshold=level)
+
+
+def _fault_details(s, raw: pd.DataFrame, faulty: list[str]) -> list[dict]:
+    """What each flagged sensor says against what the healthy ones agree on."""
+    if not faulty:
+        return []
+    res = assess(raw, s.integrity)
+    out = []
+    for c in faulty:
+        spec = SPEC_BY_COLUMN[c]
+        out.append({"column": c, "symbol": spec.symbol, "description": spec.description,
+                    "reading": round(float(raw[c].iloc[-1]), 3),
+                    "sensor_drift": float(res.drift[c].iloc[-1]),
+                    "consensus": float(res.consensus.iloc[-1]),
+                    "z": round(float(res.z[c].iloc[-1]), 1),
+                    "peers": len(s.integrity.sensors) - len(faulty)})
+    return out
 
 
 runner = SimulationRunner(on_cycle=_sim_cycle)
@@ -152,8 +230,10 @@ def state() -> State:
                 lo, hi = space.coords.min(axis=0), space.coords.max(axis=0)
                 center, scale = (lo + hi) / 2, np.maximum((hi - lo) / 2, 1e-9)
                 layers = layer_model(rul_artifacts.model)
+            integrity = fit_integrity(calibrations, artifacts.subset)
             runner.bind(artifacts, rul_artifacts,
-                        measure_profile(artifacts.feature_cols, artifacts.subset))
+                        measure_profile(artifacts.feature_cols, artifacts.subset), integrity)
+            runner.scorer.forced = notes.excluded(SIM_ID)
             alerts.reset_engine(SIM_ID)
             _state = State(
                 signature=signature,
@@ -170,6 +250,7 @@ def state() -> State:
                 display_center=center,
                 display_scale=scale,
                 layers=layers,
+                integrity=integrity,
             )
         return _state
 
@@ -270,25 +351,51 @@ def api_fleet():
     )
     informative = [c for c, cal in s.calibrations.items() if cal.informative]
 
+    # Engines where a technician excluded a sensor are scored on repaired readings,
+    # so the list agrees with the engine view
+    repaired = {}
+    for key in list(notes.data):
+        if key.isdigit() and notes.excluded(key) and s.integrity is not None:
+            d = engine_data(s, key)
+            integrity_payload(s, d, model)
+            repaired[int(key)] = (float(d.history[probability_col].iloc[-1]),
+                                  d.predicted[-1] if d.predicted else None)
+
     engines = []
     for _, row in latest.iterrows():
         engine = int(row[config.UNIT_COL])
         drifts = latest_drift.loc[engine, informative]
         worst = drifts.idxmax()
+        prob = repaired[engine][0] if engine in repaired else float(row[probability_col])
         engines.append({
             "engine": engine,
             "cycles": int(row[config.CYCLE_COL]),
-            "probability": round(float(row[probability_col]), 4),
+            "probability": round(prob, 4),
+            "sensor_excluded": engine in repaired,
             "true_rul": int(s.true_rul_at_end[engine]),
-            "predicted_rul": (round(float(predicted_at_end[engine]), 1)
-                              if predicted_at_end is not None else None),
+            "predicted_rul": (round(float(repaired[engine][1]), 1) if engine in repaired and repaired[engine][1] is not None
+                              else round(float(predicted_at_end[engine]), 1) if predicted_at_end is not None else None),
             "in_failure_window": bool(row[config.LABEL_COL]),
             "critical_sensors": int((drifts >= CRITICAL_LEVEL).sum()),
             "warning_sensors": int(((drifts >= WARNING_LEVEL) & (drifts < CRITICAL_LEVEL)).sum()),
             "worst_sensor": SPEC_BY_COLUMN[worst].symbol,
         })
     engines.sort(key=lambda e: e["probability"], reverse=True)
-    return jsonify(model=model, token=signature_token(s.signature), engines=engines)
+
+    predicted_now = {e["engine"]: e["predicted_rul"] for e in engines if e["predicted_rul"] is not None}
+    latest_for_suggest = latest.copy()
+    for engine, (prob, _) in repaired.items():
+        latest_for_suggest.loc[latest_for_suggest[config.UNIT_COL] == engine, probability_col] = prob
+    inspect_next = suggest_inspections(latest_for_suggest, alerts.threshold, predicted_now)
+    reasons = {d["engine"]: d["reasons"] for d in inspect_next}
+    for e in engines:
+        e["inspect_next"] = reasons.get(e["engine"])
+        e["inspected"] = bool(inspections.history(e["engine"]))
+        m = inspections.memory(e["engine"])
+        e["memory_level"] = m["level"] if m and m["from_cycle"] <= e["cycles"] <= m["until_cycle"] else None
+    return jsonify(model=model, token=signature_token(s.signature), engines=engines,
+                   inspect_next=inspect_next,
+                   repair_plan=repair_plan(predicted_now) if predicted_now else None)
 
 
 @dataclass
@@ -358,11 +465,39 @@ def api_engine(engine_id: str):
         column: round(float(history[column].iloc[-1]), 4)
         for column in config.SENSOR_COLS if column not in s.calibrations
     }
+    integrity, probability_raw, predicted_raw = integrity_payload(s, d, model)
+    trust = load_trust()
+    predicted_range = None
+    if trust and d.predicted:
+        # every engine here is monitored from new, so cycles observed = position in its record
+        bounds = [likely_range(p, k + 1, trust) for k, p in enumerate(d.predicted)]
+        predicted_range = {"lo": [b[0] for b in bounds], "hi": [b[1] for b in bounds],
+                           "window": trust["window"], "trusted_after": trust["trusted_after"],
+                           "coverage": trust["coverage"]}
+    key = d.key
+    companions = None
+    if d.predicted and key != SIM_ID:
+        latest_pred = d.predicted[-1]
+        if latest_pred <= SAFETY + DEFAULT_HORIZON:
+            fleet_pred = {}
+            if s.predicted_rul is not None:
+                fleet_pred = latest_per_engine(s.predicted_rul).set_index(config.UNIT_COL)["predicted_rul"].to_dict()
+            fleet_pred[key] = latest_pred
+            companions = repair_plan(fleet_pred, anchor=key)
+            companions["join"] = [{"engine": int(e), "predicted_rul": round(float(fleet_pred[e]), 1)}
+                                  for e in companions["join"]]
     return jsonify(
+        inspections=inspections.history(key),
+        alert_memory=inspections.memory(key),
+        repair_group=companions,
+        predicted_range=predicted_range,
         engine=d.key,
         model=model,
         cycles=[int(c) for c in history[config.CYCLE_COL]],
         probability=round_list(history[PROBABILITY_COLUMNS[model]], 4),
+        probability_raw=probability_raw,
+        predicted_rul_raw=predicted_raw,
+        integrity=integrity,
         true_rul=d.truth,
         truth_label=d.truth_label,
         predicted_rul=d.predicted,
@@ -372,6 +507,46 @@ def api_engine(engine_id: str):
         settings={c: round(float(history[c].iloc[-1]), 4) for c in config.SETTING_COLS},
         sim=d.sim,
     )
+
+
+def integrity_payload(s: State, d: EngineData, model: str):
+    """Cross-check of every guarded sensor at every cycle. When a sensor is
+    flagged, also return what the models said before the repair."""
+    if s.integrity is None:
+        return None, None, None
+    raw_cols = [config.UNIT_COL, config.CYCLE_COL] + config.SETTING_COLS + config.SENSOR_COLS
+    forced = [c for c in notes.excluded(d.key) if c in s.integrity.sensors]
+    res = assess(d.history[raw_cols], s.integrity, forced)
+    payload = {
+        **s.integrity.public(),
+        "excluded_by_technician": forced,
+        "z": {c: round_list(res.z[c], 2) for c in s.integrity.sensors},
+        "flags": {c: [bool(v) for v in res.flags[c]] for c in s.integrity.sensors},
+        "consensus": round_list(res.consensus, 4),
+        "any_flagged": bool(res.flags.to_numpy().any()),
+    }
+    from src.unfamiliar_wear import pattern_flags
+    count, unfamiliar = pattern_flags(res)
+    payload["unfamiliar"] = [bool(v) for v in unfamiliar]
+    payload["disagreeing"] = [int(v) for v in count]
+    if not payload["any_flagged"]:
+        return payload, None, None
+    col = PROBABILITY_COLUMNS[model]
+    if d.key == SIM_ID:
+        # the simulator already scored repaired readings; it kept the raw scores too
+        prob_raw = round_list(d.history["raw_" + col], 4)
+        pred_raw = (None if d.history["raw_predicted_rul"].isna().all()
+                    else round_list(d.history["raw_predicted_rul"], 1))
+        return payload, prob_raw, pred_raw
+    # A recorded engine with a flagged sensor: score the repaired readings now
+    from src.inference import score_frame
+    prob_raw = round_list(d.history[col], 4)
+    repaired = score_frame(s.artifacts, res.corrected)
+    d.history[col] = repaired[col].to_numpy()
+    pred_raw = d.predicted
+    if s.rul is not None:
+        d.predicted = round_list(predict_rul_every_cycle(s.rul, res.corrected)["predicted_rul"], 1)
+    return payload, prob_raw, pred_raw
 
 
 @app.get("/api/engine/<engine_id>/explain")
@@ -385,9 +560,22 @@ def api_explain(engine_id: str):
     if row.empty:
         abort(404, description=f"Engine {engine_id} has no cycle {cycle}")
 
+    repaired = False
+    if s.integrity is not None:
+        raw_cols = [config.UNIT_COL, config.CYCLE_COL] + config.SETTING_COLS + config.SENSOR_COLS
+        upto = history[history[config.CYCLE_COL] <= int(row[config.CYCLE_COL].iloc[0])][raw_cols]
+        res = assess(upto, s.integrity, notes.excluded(engine_data_key(engine_id)))
+        if res.flags.iloc[-1].any():
+            # explain what the models actually scored: the repaired reading
+            row = row.copy()
+            for c in res.flags.columns[res.flags.iloc[-1].to_numpy()]:
+                row[c] = res.corrected[c].iloc[-1]
+            row[PROBABILITY_COLUMNS[model]] = score_frame_one(s, row, model)
+            repaired = True
     explanation = explain(s.artifacts, row, model)
     frame = explanation.contributions()
     return jsonify(
+        repaired=repaired,
         engine=engine_data_key(engine_id),
         model=model,
         cycle=int(row[config.CYCLE_COL].iloc[0]),
@@ -401,6 +589,51 @@ def api_explain(engine_id: str):
             for r in frame.itertuples()
         ],
     )
+
+
+def score_frame_one(s: State, row: pd.DataFrame, model: str) -> float:
+    from src.inference import score_frame
+    return float(score_frame(s.artifacts, row)[PROBABILITY_COLUMNS[model]].iloc[0])
+
+
+@app.post("/api/engine/<engine_id>/inspection")
+def api_inspection(engine_id: str):
+    """Record what a technician found."""
+    s = state()
+    body = request.get_json(silent=True) or {}
+    d = engine_data(s, engine_id)
+    cycle = int(body.get("cycle") or d.history[config.CYCLE_COL].iloc[-1])
+    row = d.history[d.history[config.CYCLE_COL] == cycle]
+    if row.empty:
+        abort(400, description=f"No cycle {cycle} for this engine")
+    k = row.index[0] - d.history.index[0]
+    risk = float(row[PROBABILITY_COLUMNS[alerts.model]].iloc[0])
+    predicted = d.predicted[k] if d.predicted else None
+    try:
+        entry = inspections.record(d.key, cycle, str(body.get("outcome")), risk, predicted, str(body.get("note", "")))
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    if d.key == SIM_ID:
+        alerts.acknowledge(SIM_ID)
+    return jsonify(entry=entry, memory=inspections.memory(d.key), history=inspections.history(d.key))
+
+
+@app.post("/api/engine/<engine_id>/sensor-note")
+def api_sensor_note(engine_id: str):
+    """A technician marks a sensor faulty, or trusts it again."""
+    s = state()
+    body = request.get_json(silent=True) or {}
+    sensor, faulty = body.get("sensor"), bool(body.get("faulty"))
+    if s.integrity is None or sensor not in s.integrity.sensors:
+        abort(400, description="Only cross-checked sensors can be excluded; their value is rebuilt "
+                               "from the other cross-checked sensors.")
+    key = engine_data_key(engine_id)
+    excluded = notes.set_excluded(key, sensor, faulty)
+    if key == SIM_ID:
+        with runner.lock:
+            runner.scorer.forced = excluded
+            runner.version += 1
+    return jsonify(engine=key, excluded=excluded)
 
 
 def engine_data_key(engine_id: str):
@@ -578,15 +811,19 @@ def api_sim_control():
         elif action == "reset":
             runner.reset()
             alerts.reset_engine(SIM_ID)
+            inspections.clear(SIM_ID)
         elif action == "demo":
             runner.run_demo()
             alerts.reset_engine(SIM_ID)
+            inspections.clear(SIM_ID)
         elif action == "speed":
             runner.set_speed(int(body["value"]))
         elif action == "wear":
             runner.set_wear(str(body["value"]))
         elif action == "fault":
             runner.set_fault(bool(body["value"]))
+        elif action == "fan_fault":
+            runner.set_fan_fault(bool(body["value"]))
         elif action == "override":
             value = body.get("value")
             runner.set_override(str(body["column"]), None if value is None else float(value))
@@ -621,7 +858,205 @@ def api_alerts_rule():
     return jsonify(alerts.rule())
 
 
+# --------------------------------------------------------------- insights --
+
+INSIGHT_COMMANDS = {
+    "trust": "python -m src.trust",
+    "inspection": "python -m src.active_inspection",
+    "repairs": "python -m src.maintenance_plan",
+    "sensor_kit": "python -m src.sensor_kit",
+    "unfamiliar": "python -m src.unfamiliar_wear",
+    "adaptation": "python -m src.adaptation",
+    "integrity": "python -m src.sensor_integrity",
+}
+
+
+@app.get("/api/insights/<name>")
+def api_insight(name: str):
+    """Results of the fleet-level analyses, computed offline by their CLI."""
+    if name not in INSIGHT_COMMANDS:
+        abort(404, description=f"No analysis called {name}")
+    import json
+    path = config.MODELS_DIR / "insights" / f"{name}.json"
+    try:
+        return jsonify({"available": True, **json.loads(path.read_text(encoding="utf-8"))})
+    except (OSError, ValueError):
+        # A normal answer, not an error: the analysis simply has not been run
+        return jsonify(available=False, command=INSIGHT_COMMANDS[name])
+
+
+# ---------------------------------------------------------------------- bob ----
+
+def engine_findings(s: State, engine_id: str, cycle: int | None = None,
+                    model: str | None = None, threshold: float | None = None):
+    model = model or model_param()
+    profile = load_profile(DEFAULT_MACHINE)
+    d = engine_data(s, engine_id)
+    history = d.history
+    if history.empty:
+        abort(404, description=f"No data for engine {engine_id}")
+
+    if cycle is not None and cycle in history[config.CYCLE_COL].values:
+        idx = history.index[history[config.CYCLE_COL] == cycle][0]
+        c_val = int(cycle)
+    else:
+        idx = history.index[-1]
+        c_val = int(history[config.CYCLE_COL].iloc[-1])
+
+    pos = history.index.get_loc(idx)
+    prob_col = PROBABILITY_COLUMNS[model]
+    prob = float(history[prob_col].iloc[pos])
+
+    if threshold is None:
+        try:
+            threshold = float(request.args.get("threshold", 0.5))
+        except (ValueError, TypeError):
+            threshold = 0.5
+
+    r_now = float(d.predicted[pos]) if (d.predicted and pos < len(d.predicted)) else None
+    trust = load_trust()
+    rng = likely_range(r_now, pos + 1, trust) if (trust and r_now is not None) else None
+
+    drift = {c: float(d.drift[c].iloc[pos]) for c in s.calibrations if c in d.drift.columns}
+
+    raw_cols = [config.UNIT_COL, config.CYCLE_COL] + config.SETTING_COLS + config.SENSOR_COLS
+    forced = [c for c in notes.excluded(d.key) if c in s.integrity.sensors] if s.integrity else []
+    res = assess(d.history.iloc[:pos + 1][raw_cols], s.integrity, forced) if s.integrity else None
+    flagged = [c for c in res.flags.columns if bool(res.flags[c].iloc[-1])] if res is not None else []
+
+    unfamiliar = False
+    if res is not None:
+        try:
+            _, unf_series = pattern_flags(res)
+            unfamiliar = bool(unf_series.iloc[-1]) if not unf_series.empty else False
+        except Exception:
+            unfamiliar = False
+
+    row = d.history.iloc[[pos]][config.RAW_COLUMNS]
+    if flagged and res is not None:
+        row = res.corrected.iloc[[-1]]
+    exp = explain(s.artifacts, row, model).contributions()
+    shap = {r.feature: float(r.shap_value) for r in exp.itertuples() if profile.sensor(r.feature)}
+
+    status = status_from_rule(prob, threshold, r_now, profile.labelling.get("failure_window", 30), drift)
+
+    f = Findings(machine=profile.id, unit=str(d.key), cycle=c_val, status=status,
+                 probability=prob, threshold=threshold, model=model, rul=r_now, rul_range=rng,
+                 shap=shap, drift=drift, flagged=flagged, unfamiliar=unfamiliar)
+    return profile, f
+
+
+@app.get("/api/bob/providers")
+def api_bob_providers():
+    active = get_provider()
+    return jsonify(providers=list_providers(), active=active.name, active_label=active.label)
+
+
+@app.get("/api/bob/workorder/<engine_id>")
+def api_bob_workorder(engine_id: str):
+    s = state()
+    cycle = request.args.get("cycle", type=int)
+    model = request.args.get("model")
+    prov_name = request.args.get("provider")
+    threshold = request.args.get("threshold", type=float)
+
+    profile, f = engine_findings(s, engine_id, cycle=cycle, model=model, threshold=threshold)
+    provider = get_provider(prov_name) if prov_name else None
+    order = make_work_order(f, profile, provider=provider)
+    return jsonify(order)
+
+
+@app.get("/api/bob/workorder/<engine_id>/html")
+def api_bob_workorder_html(engine_id: str):
+    s = state()
+    cycle = request.args.get("cycle", type=int)
+    model = request.args.get("model")
+    prov_name = request.args.get("provider")
+    threshold = request.args.get("threshold", type=float)
+
+    profile, f = engine_findings(s, engine_id, cycle=cycle, model=model, threshold=threshold)
+    provider = get_provider(prov_name) if prov_name else None
+    order = make_work_order(f, profile, provider=provider)
+    return render_html(order), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.post("/api/bob/chat")
+def api_bob_chat():
+    s = state()
+    data = request.get_json(silent=True) or {}
+    engine_id = str(data.get("engine_id") or "sim")
+    cycle = data.get("cycle")
+    if cycle is not None:
+        try:
+            cycle = int(cycle)
+        except (ValueError, TypeError):
+            cycle = None
+    model = data.get("model")
+    prov_name = data.get("provider")
+    threshold = data.get("threshold")
+    if threshold is not None:
+        try:
+            threshold = float(threshold)
+        except (ValueError, TypeError):
+            threshold = 0.5
+    message = str(data.get("message") or "").strip()
+    history = data.get("history") or []
+
+    if not message:
+        return jsonify(error="Empty message"), 400
+
+    profile, f = engine_findings(s, engine_id, cycle=cycle, model=model, threshold=threshold)
+    from src.bob.chat import chat_with_bob
+    res = chat_with_bob(f, profile, message=message, history=history, provider_name=prov_name)
+    return jsonify(res)
+
+
+@app.get("/api/bob/grounding")
+def api_bob_grounding():
+    import json
+    path = config.MODELS_DIR / "insights" / "bob_grounding.json"
+    if path.exists():
+        try:
+            return jsonify(available=True, **json.loads(path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            return jsonify(available=False, error=str(exc))
+    return jsonify(available=False, command="python -m src.bob")
+
+
+@app.get("/api/machines")
+def api_machines():
+    import json
+    machines = []
+    if MACHINES_DIR.exists():
+        for p in sorted(MACHINES_DIR.iterdir()):
+            prof_file = p / "profile.json"
+            if prof_file.exists():
+                try:
+                    data = json.loads(prof_file.read_text(encoding="utf-8"))
+                    machines.append({
+                        "id": data.get("id", p.name),
+                        "name": data.get("name", p.name),
+                        "machine_type": data.get("machine_type", "industrial equipment"),
+                        "unit_label": data.get("unit_label", "unit"),
+                        "time_unit": data.get("time_unit", "cycle"),
+                        "tasks": data.get("tasks_enabled", {}),
+                    })
+                except Exception:
+                    pass
+    return jsonify(machines=machines, active=DEFAULT_MACHINE)
+
+
+@app.get("/api/machines/<machine_id>")
+def api_machine_profile(machine_id: str):
+    try:
+        prof = load_profile(machine_id)
+        return jsonify(prof.data)
+    except Exception as exc:
+        abort(404, description=f"Machine profile {machine_id} not found: {exc}")
+
+
 @app.errorhandler(400)
+
 @app.errorhandler(404)
 @app.errorhandler(503)
 def json_error(error):

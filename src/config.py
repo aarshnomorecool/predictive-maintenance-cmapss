@@ -37,15 +37,25 @@ def _locate_data_dir() -> Path:
 DATA_DIR = _locate_data_dir()
 
 # --------------------------------------------------------------- columns ----
+# The turbofan's columns and labelling rules live in its machine profile, like
+# every other machine's (src/profiles.py). These names are the turbofan's.
 
-UNIT_COL = "unit"
-CYCLE_COL = "cycle"
-SETTING_COLS = ["setting_1", "setting_2", "setting_3"]
-SENSOR_COLS = [f"sensor_{i}" for i in range(1, 22)]
+def _turbofan_profile() -> dict:
+    import json
+    path = PROJECT_ROOT / "machines" / "turbofan" / "profile.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+_TURBOFAN = _turbofan_profile()
+
+UNIT_COL = _TURBOFAN["columns"]["unit"]
+CYCLE_COL = _TURBOFAN["columns"]["time"]
+SETTING_COLS = list(_TURBOFAN["columns"]["settings"])
+SENSOR_COLS = list(_TURBOFAN["columns"]["sensors"])
 RAW_COLUMNS = [UNIT_COL, CYCLE_COL] + SETTING_COLS + SENSOR_COLS
 
 RUL_COL = "RUL"
-LABEL_COL = "failure_soon"
+LABEL_COL = _TURBOFAN["columns"]["label"]
 
 # ------------------------------------------------------------- behaviour ----
 
@@ -54,11 +64,11 @@ RANDOM_SEED = 42
 
 # Rule 1: piecewise-linear RUL. Degradation is not observable before this many
 # cycles remain, so a flat ceiling is a truer target than an unbounded ramp.
-RUL_CLIP = 125
+RUL_CLIP = _TURBOFAN["labelling"]["rul_clip"]                       # 125
 
 # Binary classification target: an engine is "failing soon" once RUL drops to
 # this many cycles or fewer. 30 is the common C-MAPSS convention.
-FAILURE_THRESHOLD = 30
+FAILURE_THRESHOLD = _TURBOFAN["labelling"]["failure_window"]        # 30
 
 # Rule 5: sensors whose normalised spread falls below this are near-constant
 # and carry no signal. Measured, not hardcoded.

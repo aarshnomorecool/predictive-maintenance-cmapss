@@ -5,7 +5,12 @@ turbofan engine dataset, with a live web dashboard built around an interactive
 3D cutaway of the engine.
 
 Classical ML answers *"will this engine fail soon"*, an LSTM answers
-*"how many cycles remain"*. Everything runs locally, no cloud services.
+*"how many cycles remain"*. On top of that, eight measured features answer the
+questions an engineer asks next: is it the engine or the sensor, is this a
+failure the models have never seen, how far can the number be trusted, which
+engine should be inspected next, and which engines should share a workshop
+visit (see [Beyond prediction](#beyond-prediction)). Everything runs locally,
+no cloud services.
 
 **B.Tech 7th Semester Final Year Project**
 Priyadarshini College of Engineering, Nagpur
@@ -112,8 +117,19 @@ Requires **Python 3.10 or newer**. Tested on 3.13.
 | `python -m src.simulator` | Checks the trained models read simulated engines the way they read real ones |
 | `python -m src.alerts --test` | Shows the email settings and sends one test email |
 | `python -m src.sensor_health` | Per-sensor health calibration, and a check that the colour bands separate failing engines |
+| `python -m src.sensor_integrity` | Injects sensor faults into real engines and measures the sensor guard |
+| `python -m src.unfamiliar_wear` | Tests the unfamiliar-wear detector on NASA's FD003 fleet |
+| `python -m src.trust` | Measures the likely range shown with each prediction, and time to trust after a retrofit |
+| `python -m src.active_inspection` | Compares ways of choosing which engines to inspect next |
+| `python -m src.maintenance_plan` | Simulates grouped workshop visits on a fleet with staggered start dates |
+| `python -m src.sensor_kit` | Finds the smallest sensor kit that keeps accuracy (a few minutes) |
+| `python -m src.adaptation` | Runs the FD001 models on the FD002 fleet using its healthy running only (a few minutes) |
 | `python -m api.server` | **Launch the dashboard** at http://127.0.0.1:8050 |
 | `streamlit run dashboard/app.py` | The earlier, simpler Streamlit view |
+
+The seven analysis commands save their results to `models/insights/`, and the
+dashboard shows them under **Fleet insights**. Run them after training; each
+tab that has no results yet shows the command to run.
 
 ### Training options
 
@@ -213,6 +229,142 @@ remaining-life chart shows exactly this.
 
 Training is seeded, but TensorFlow on CPU is not guaranteed bit-for-bit
 deterministic, so a retrain can land slightly off these exact numbers.
+
+---
+
+## Beyond prediction
+
+Failure classifiers and remaining-life models are standard. These features
+answer the questions an engineer asks after the prediction, and each one is
+measured, not just built. The numbers below come from the commands in the
+table above, and the dashboard shows them under **Fleet insights**.
+
+| Question | Feature | Measured result |
+|---|---|---|
+| Is it the engine, or the sensor? | Sensor integrity guard | 0 of 100 clean engines flagged; a stuck sensor's LSTM error 18.2 → 14.1 cycles |
+| Is this a failure the models never saw? | Unfamiliar wear | 44 of 44 FD003 fan-wear engines flagged, median 199 cycles before failure; 0 false flags |
+| How far can the number be trusted? | Likely range, time to trust | 80% range, truth inside 78% of the time; settled after ~46 cycles of data |
+| Which engine should be inspected next? | Active inspection | ROC-AUC 0.989 vs 0.984 (random) and 0.974 (riskiest first) after 84 inspections |
+| What did the technician find? | Inspection memory | "No fault found" raises that engine's alert level for 30 cycles |
+| Which engines should share a visit? | Group repairs | 62% fewer workshop visits, 0 failures in service |
+| How few sensors are enough? | Minimal sensor kit | 3 sensors: ROC-AUC 0.982 vs 0.987 with all 15 |
+| Can it work on a new fleet from day one? | Healthy-data adaptation | FD002 LSTM RMSE 60.8 → 22.1 with zero FD002 failure labels |
+
+### Is it the engine, or the sensor?
+
+A sensor that sticks, freezes or drifts looks to a model exactly like engine
+wear. In FD001 every informative sensor is driven by the same degradation, so
+each sensor's drift towards failure is an independent estimate of the same
+quantity. The guard compares every sensor with the median of the others,
+scaled by how much that sensor naturally disagrees on training engines. A
+sensor more than 8 robust standard deviations off for 3 cycles in a row is
+flagged as a suspected fault, its reading is rebuilt from the other sensors,
+and every model is scored again on the rebuilt value. A technician can also
+mark a sensor faulty by hand, or trust it again. This is analytical
+redundancy, an established idea in aerospace fault detection, applied to the
+ML pipeline and measured by adding faults to real recordings
+(`python -m src.sensor_integrity`):
+
+| Fault added | Caught, test engines | Caught, engines run to failure | Wrong sensor blamed |
+|---|---|---|---|
+| Stuck at failure level | 81% | 65% | 0% |
+| Frozen | 4% | 70% | 0% |
+| Bias of +4 standard deviations | 100% | 100% | 0% |
+| Slow drift | 96% | 100% | 0% |
+
+No clean engine is ever flagged: 0 of the 100 test engines and 0 of 60
+simulated engines. With one sensor stuck at its failure level on healthy
+engines, the LSTM's error drops from 18.2 to 14.1 cycles with the guard on.
+Ten sensors are cross-checked; the four shaft speeds (Nf, Nc, NRf, NRc)
+follow wear too loosely for a fault on them to stand out from normal scatter.
+
+### Is this a failure the models never saw?
+
+The models learned one way of wearing out, compressor (HPC) wear. When two or
+more cross-checked sensors disagree with that pattern at once, and keep doing
+so, the engine is wearing out in a way the models were never trained on, and
+the page marks its remaining-life number as not reliable. Calibrated on FD001
+alone and tested on NASA's FD003 fleet (`python -m src.unfamiliar_wear`):
+
+- all 44 fan-wear engines flagged, a median of 199 cycles before failure
+- 0 of 56 compressor-wear engines and 0 of 200 FD001 engines flagged
+- why it matters: in the last 60 cycles the LSTM is off by 94 cycles (RMSE)
+  on fan wear, against 9.7 on compressor wear
+
+### How far can the number be trusted?
+
+Every remaining-life prediction carries an 80% likely range ("41 cycles,
+likely 34 to 54"), taken from the LSTM's own errors on the 20 validation
+engines, grouped by predicted life: near failure the model is precise (about
+±5 cycles), in mid-life it is not. Checked on those engines, the truth fell
+inside the range 78% of the time. For sensors fitted to an already part-worn
+engine, with no history, predictions settle after about 46 cycles of data,
+and the panel says when confidence is still building (`python -m src.trust`).
+
+### Which engine should be inspected next?
+
+Inspections are the costly part of getting labels, so each should teach the
+model as much as possible. The fleet list marks up to three engines
+**Inspect next**: where the risk sits near the alert level, the two
+classifiers disagree, or the LSTM contradicts them. Simulated from four
+labelled inspections plus five per round, scored on the 100 test engines
+(`python -m src.active_inspection`):
+
+| Choosing the next inspections | Inspections to reach ROC-AUC 0.98 | ROC-AUC after 84 |
+|---|---|---|
+| **Explore at random, then least sure** | **24** | **0.989** |
+| Least sure only | 29 | 0.988 |
+| Random | 24 | 0.984 |
+| Riskiest first (common practice) | not reached | 0.974 |
+
+### What did the technician find?
+
+Each engine panel records inspections with an outcome and a note. "No fault
+found" sets that engine's own alert level to its risk at inspection plus 10
+points (at most 95%) for the next 30 cycles, so an engine just checked does
+not re-alert immediately. The LSTM clause (30 cycles or fewer predicted) is
+never silenced by an inspection.
+
+### Which engines should share a workshop visit?
+
+Every visit has a fixed cost. When an engine is due (15 cycles of predicted
+life), the panel lists the engines predicted to be due within the next 20
+cycles, to service together. Checked by placing the 20 validation engines on
+one calendar with staggered start dates and running them forward on the
+LSTM's real prediction at every cycle, 30 random calendars
+(`python -m src.maintenance_plan`):
+
+| Policy | Workshop visits | Failures in service | True life left at service |
+|---|---|---|---|
+| Each engine alone | 18.9 | 0 | 16.2 cycles |
+| **Grouped, 20 cycles ahead** | **7.1 (62% fewer)** | **0** | **24.2 cycles** |
+| Grouped, 40 cycles ahead | 5.1 (73% fewer) | 0 | 33.2 cycles |
+
+The price is about 8 cycles of life given up per engine.
+
+### How few sensors are enough?
+
+Fitting sensors to existing machines costs money per channel. Backward
+elimination, choosing on validation engines only and scoring every kit on the
+100 test engines (`python -m src.sensor_kit`): 3 sensors (Nf, Ps30, NRc) keep
+the classifier at ROC-AUC 0.982 against 0.987 with all 15. Remaining life
+needs more: the LSTM's RMSE is 13.94 with 15 sensors, 14.16 with 8 and 15.80
+with 3.
+
+### Can it work on a new fleet from day one?
+
+A new site has no failures yet, so nothing can be trained on it. FD002 flies
+in six flight conditions and its raw readings jump with the condition far
+more than with wear. The adaptation uses only each new engine's first 30
+cycles of normal running to learn what healthy looks like in each condition,
+then translates every reading into FD001's terms; the FD001 models are
+unchanged (`python -m src.adaptation`). On the 259 FD002 test engines:
+
+| | LSTM RMSE | XGBoost ROC-AUC | FD002 failure labels used |
+|---|---|---|---|
+| FD001 models, raw readings | 60.8 | 0.783 | none |
+| **FD001 models, translated readings** | **22.1** | **0.973** | **none** |
+| LSTM trained on FD002 | 14.4 | – | all |
 
 ---
 
@@ -324,6 +476,7 @@ level to its failure level, both measured on training engines only:
 | Red | Near the level engines reach in their last 10 cycles (75% and above) |
 | Grey | Too little signal: the sensor barely changes with wear (P15) |
 | Hollow | Not used by the models, reading is constant across the fleet |
+| Magenta | Suspected sensor fault: disagrees with the other sensors (see the sensor guard above) |
 
 The bands are checked, not guessed: at their latest cycle, engines inside the
 failure window average 5.6 red sensors, engines outside it average 0.2
@@ -369,6 +522,12 @@ live. Controls under the engine:
 - **Inject HPC fault** — makes degradation progress three times faster.
   FD001 has one fault mode, HPC degradation, so this speeds up the fault the
   models were trained on rather than inventing one they never saw
+- **Inject unfamiliar fault** — adds fan wear with the sensor fingerprint
+  measured on FD003's fan-wear engines, a failure the models never saw. The
+  page reports an unfamiliar wear pattern and stops trusting the life estimate
+- **Break a sensor** — sticks Ps30, the reading the models lean on most, at
+  its failure level. The guard flags it, rebuilds it from the other sensors,
+  and the models score the rebuilt value instead of the broken one
 - **New engine** — fits a fresh engine with its own random initial wear and
   manufacturing offsets
 - **Run demo** — a fixed, repeatable scenario for presentations: healthy
@@ -387,14 +546,18 @@ damage value drives all sensors together, growing exponentially as C-MAPSS
 degradation does. Because the wear rate is known, the simulator also knows
 the true remaining life, shown as "projected life left".
 
+Each simulated engine borrows the manufacturing offsets of a real training
+engine, so its sensors disagree with each other only as much as real ones
+do: the sensor guard flags none of 60 clean simulated engines.
+
 It is checked against the models (`python -m src.simulator`): under normal
-wear the LSTM predicts simulated engines with RMSE 14.9 cycles, close to its
-13.58 on real test engines, and both classifiers separate failing from
-healthy cycles with ROC-AUC 0.94. Under fast wear or an injected fault the
-LSTM is less accurate (RMSE 22 to 29) and alerts come later, because every
-real FD001 engine degrades at a natural pace and the model learned that
-timescale. That is a property of the trained model, shown honestly, not
-hidden.
+wear the LSTM predicts simulated engines with RMSE 15.0 cycles, close to its
+13.58 on real test engines, and the classifiers separate failing from
+healthy cycles with ROC-AUC 0.93 (XGBoost) and 0.92 (Random Forest). Under
+fast wear or an injected fault the LSTM is less accurate (RMSE 25 to 27) and
+alerts come later, because every real FD001 engine degrades at a natural
+pace and the model learned that timescale. That is a property of the trained
+model, shown honestly, not hidden.
 
 **Email alerts.** Alerts are raised for the live engine and sent by email.
 The rule, chosen by measuring candidates on the 20 real validation engines
@@ -405,16 +568,18 @@ The rule, chosen by measuring candidates on the 20 real validation engines
 
 | Rule | Shortest warning, real engines | Early false alarms | Shortest warning, HPC fault |
 |---|---|---|---|
-| Single cycle over 50% | 22 cycles | 1 | 14 cycles (but 1 early false alarm) |
-| **5-cycle average, or LSTM ≤ 30** | **27 cycles** | **0** | **15 cycles** |
+| Single cycle over 50% | 22 cycles | 1 | 9 cycles |
+| **5-cycle average, or LSTM ≤ 30** | **27 cycles** | **0** | **13 cycles** |
 
 Averaging stops one noisy reading from raising an alarm; the LSTM clause
 catches fast faults the classifier reacts to late. Each engine alerts once,
 then only again after it has clearly recovered, so a failing engine does not
 send an email every cycle. The email gives the risk, predicted life, the
 three sensors pushing the risk up most (SHAP) and a link to the engine on the
-dashboard. The **Alerts** button in the top bar shows every alert, whether
-its email was sent, and the exact text.
+dashboard. Two more kinds of email go out: a **sensor fault** when the guard
+flags a sensor (once per sensor), and **unfamiliar wear** when the engine's
+wear stops matching anything the models know. The **Alerts** button in the
+top bar shows every alert, whether its email was sent, and the exact text.
 
 To turn on email, copy `.env.example` to `.env` and fill it in (Gmail needs
 an [app password](https://myaccount.google.com/apppasswords), not your normal
@@ -426,6 +591,18 @@ dashboard says so, and a phone hotspot usually works.
 **Replay.** The play control and cycle slider step through the engine's
 recorded cycles. Sensor colours, risk, remaining life and SHAP drivers all
 follow the selected cycle, so you can watch an engine degrade.
+
+**Fleet insights.** The button in the fleet panel opens one tab per
+feature in [Beyond prediction](#beyond-prediction), with the measured
+results, charts, and what each suggests for this fleet right now: the
+engines to inspect next and the next workshop visit, with links to each
+engine.
+
+**Engine panel additions.** Under the gauges: the likely range of the
+remaining-life number and whether confidence is still building, a sensor
+check (all sensors agree, a suspected fault with its rebuilt value, or an
+unfamiliar wear pattern), an inspection log with "Fault confirmed" and "No
+fault found", and the workshop plan for when this engine goes in.
 
 **Elsewhere on the page:** the fleet list ranked by risk with live alert counts,
 a model switch (Random Forest / XGBoost), an alert slider bounded to the range
@@ -460,10 +637,17 @@ The earlier Streamlit view is still in `dashboard/app.py` for comparison.
 - Live engine simulator built from measured training statistics, with
   manual sensor overrides and a scripted demo
 - Email alerts with a measured alert rule, cooldown, and an in-dashboard log
+- Sensor integrity guard with rebuilt readings and technician override
+- Unfamiliar wear detection, tested on FD003
+- Likely ranges and time to trust for remaining-life predictions
+- Inspect-next suggestions, inspection outcomes and per-engine alert memory
+- Grouped workshop planning, minimal sensor kit analysis
+- Day-one adaptation to FD002 from healthy running only
+- Fleet insights window presenting all of the above
 
 **Not built yet**
 
-- FD002 / FD004 extension with per-regime normalization
+- FD004 (six flight conditions and two fault modes together)
 
 ### Known limitations
 
@@ -479,9 +663,23 @@ Stated openly rather than discovered during a demo:
   life), which is the costlier direction. Its NASA score is still low because
   the late errors are small, but a deployment would want a safety margin or an
   asymmetric loss that pushes predictions earlier
-- The LSTM gives one number with no stated uncertainty. A prediction range
-  (for example conformal intervals calibrated on the validation engines) is
-  the natural next step
+- The likely range is empirical, from 20 validation engines. Nominally 80%,
+  it held 78% of the time on those engines, so it is slightly narrow
+- The sensor guard rarely catches a frozen sensor on short recordings (4%):
+  a frozen value only stands out once real wear moves away from it. The four
+  shaft-speed sensors cannot be cross-checked at all
+- One sensor disagreeing alone looks exactly like a sensor fault. In 15 of
+  44 FD003 fan-wear engines one sensor was blamed for a median of 11 cycles
+  before a second joined it and the page switched to unfamiliar wear, which
+  is why every sensor-fault message says to check the sensor before
+  replacing it
+- Unfamiliar wear was tested against one unseen failure mode (FD003 fan
+  wear). Other modes would need their own test
+- Inspection suggestions and grouped repairs were proven in simulation on
+  NASA's recorded engines, not with real technicians or a real workshop
+- On FD002 the adapted models (RMSE 22.1) are still well behind a model
+  trained on FD002's own failures (14.4); adaptation is a day-one bridge,
+  not a replacement for collecting failure history
 - Sensor colours measure drift towards failure, not a fault diagnosis. A red
   sensor means "reads like an engine near the end of its life", which is what
   the data supports, not "this component has broken"
@@ -505,6 +703,14 @@ src/
   latent_space.py      LSTM vectors, nearest-neighbour index, PCA, activations
   simulator.py         live virtual engine built from training statistics
   alerts.py            alert rule, email sending, alert log
+  sensor_integrity.py  sensor guard: cross-checks sensors, rebuilds faulty readings
+  unfamiliar_wear.py   flags wear patterns the models were not trained on (FD003 test)
+  trust.py             likely ranges and time to trust for remaining-life predictions
+  active_inspection.py which engines to inspect next, and the experiment behind it
+  inspections.py       inspection log and per-engine alert memory
+  maintenance_plan.py  grouped workshop visits, and the fleet simulation behind it
+  sensor_kit.py        smallest sensor kit that keeps accuracy
+  adaptation.py        FD001 models on a new fleet from healthy running only (FD002)
 api/
   server.py            Flask JSON API, serves the web dashboard
 web/
@@ -518,6 +724,8 @@ web/
 dashboard/
   app.py               earlier Streamlit UI
 models/                trained artifacts, gitignored, regenerate by training
+  insights/            results of the analysis commands, shown under Fleet insights
+  inspections.json     recorded inspections; technician_notes.json: excluded sensors
 reports/
   eda_summary.md
   figures/

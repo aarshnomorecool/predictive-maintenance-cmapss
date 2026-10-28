@@ -16,6 +16,7 @@ export const SEVERITY_COLORS = {
   critical: "#d7263d",
   low_signal: "#8c99a3",
   unmonitored: "#b9c2c9",
+  suspect: "#b4237a",          // the sensor itself looks broken, not the engine
 };
 
 // Centre of the cutaway opening, in local lathe angle. Lathe angle 0 points
@@ -246,12 +247,15 @@ export class EngineView {
     this.scene.add(this.engine);
 
     this.raycaster = new THREE.Raycaster();
-    this.pointer = new THREE.Vector2();
     this.hovered = null;
     this.downAt = null;
+    this.downTime = 0;
     const canvas = this.renderer.domElement;
     canvas.addEventListener("pointermove", (e) => this.handleMove(e));
-    canvas.addEventListener("pointerdown", (e) => { this.downAt = [e.clientX, e.clientY]; });
+    canvas.addEventListener("pointerdown", (e) => {
+      this.downAt = [e.clientX, e.clientY];
+      this.downTime = performance.now();
+    });
     canvas.addEventListener("pointerup", (e) => this.handleClick(e));
 
     new ResizeObserver(() => this.resize()).observe(container);
@@ -389,9 +393,20 @@ export class EngineView {
       ((event.clientX - rect.left) / rect.width) * 2 - 1,
       -((event.clientY - rect.top) / rect.height) * 2 + 1);
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    const meshes = [...this.markers.values()].map((m) => m.hit);
-    const hit = this.raycaster.intersectObjects(meshes, false)[0];
-    return hit ? hit.object.userData.column : null;
+    const markerMeshes = [...this.markers.values()].map((m) => m.hit);
+    const markerHits = this.raycaster.intersectObjects(markerMeshes, false);
+    if (!markerHits.length) return null;
+    const closest = markerHits[0];
+
+    // Occlusion check: ensure engine body does not block the marker on the far side
+    const allHits = this.raycaster.intersectObject(this.engine, true);
+    for (const h of allHits) {
+      if (h.object.userData.column) continue; // marker or halo
+      if (h.distance < closest.distance - 0.05) {
+        return null; // occluded by opaque engine hull
+      }
+    }
+    return closest.object.userData.column;
   }
 
   handleMove(event) {
@@ -406,10 +421,12 @@ export class EngineView {
   handleClick(event) {
     if (!this.downAt) return;
     const moved = Math.hypot(event.clientX - this.downAt[0], event.clientY - this.downAt[1]);
+    const duration = performance.now() - (this.downTime || 0);
     this.downAt = null;
-    if (moved > 5) return;               // that was an orbit drag, not a click
+    if (moved > 5 || duration > 300) return; // that was an orbit drag, not a quick click
     this.onSelect(this.pick(event));
   }
+
 
   resize() {
     const { clientWidth: w, clientHeight: h } = this.container;
